@@ -1,7 +1,44 @@
 # Project Comment Automation
 
-Project Comment Automation is an AI-powered GitHub automation system intended to analyze repositories and maintain meaningful code comments and documentation automatically.
+Project Comment Automation is a read-first, AI-assisted system for identifying undocumented Python code and proposing concise documentation changes.
 
-## Current Phase
+## Architecture
 
-This project is currently in **Phase 1: GitHub Actions foundation**. The initial workflow runs the Python entry point on demand or on a daily schedule. AI comment generation and repository analysis will be added in later phases.
+The pipeline is configuration-driven:
+
+`RepositoryManager` selects today's repositories, `GitHubManager` reads repository metadata and source files, `CodeAnalyzer` finds undocumented Python elements, `CommentGenerator` proposes documentation, `SafetyValidator` verifies that only documentation changed, and `GitHubWriter` performs an optional controlled write.
+
+The system supports Python source files only. It never lets the LLM edit files directly. Proposed source and diffs remain in memory until they pass safety validation.
+
+## Scheduling
+
+Repository names, URLs, protection flags, and temporary schedule days live in `config/repositories.yml`. Multiple repositories may run on the same day. The GitHub Actions workflow starts `python src/main.py`; the Python application determines the daily selection.
+
+## GitHub Actions
+
+The workflow supports manual `workflow_dispatch` runs and a daily schedule. It uses Python 3.12 and installs the minimal dependency listed in `requirements.txt`.
+
+Required GitHub Actions environment values are supplied through secrets:
+
+- `GITHUB_TOKEN`: the built-in token used for read-only repository access.
+- `GROQ_API_KEY`: optional repository secret used for documentation generation.
+- `GITHUB_WRITE_ENABLED`: explicitly set to `false` in the workflow.
+
+The workflow runs safely without `GROQ_API_KEY`; generation is skipped and read-only work continues when GitHub access is available.
+
+## Safety
+
+Dry-run mode is the default. Real writes require the explicit environment value `GITHUB_WRITE_ENABLED=true`, a `GITHUB_TOKEN`, a successful documentation result, and a successful `SafetyValidator` result.
+
+The writer rejects the protected `project-comment-automation` repository, workflow and configuration paths, automation source files, non-Python files, traversal or absolute paths, stale file SHAs, no-op changes, oversized diffs, and malformed validation results. Protected logic is enforced at the writer boundary, not only by scheduling.
+
+No API keys or tokens belong in source code, YAML, configuration, or this README. The project does not create commits, pushes, or pull requests unless an explicitly enabled future execution passes every write guard.
+
+## Local checks
+
+```powershell
+python -m pytest -q
+python src/main.py
+```
+
+Without credentials, the application reports skipped GitHub access and remains read-only.

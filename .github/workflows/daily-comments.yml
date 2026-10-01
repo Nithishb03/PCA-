@@ -5,9 +5,16 @@ name: Daily Comment Automation
   schedule:
     - cron: "30 5 * * *"
 
+permissions:
+  contents: read
+
 jobs:
   run-automation:
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GITHUB_WRITE_ENABLED: "false"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

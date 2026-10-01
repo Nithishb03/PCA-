@@ -1,1 +1,58 @@
-repositories: []
+repositories:
+  # Temporary rotation for Phase 2; schedule days are not permanent.
+  - name: badge
+    url: https://github.com/Nithishb03/badge
+    schedule_day: Monday
+    protected: false
+  - name: Beam_Crack_Detection_System
+    url: https://github.com/Nithishb03/Beam_Crack_Detection_System
+    schedule_day: Monday
+    protected: false
+  - name: carbon-credit-
+    url: https://github.com/Nithishb03/carbon-credit-
+    schedule_day: Tuesday
+    protected: false
+  - name: credit-card-fraud-detection
+    url: https://github.com/Nithishb03/credit-card-fraud-detection
+    schedule_day: Tuesday
+    protected: false
+  - name: emergency-blood-donar-finder
+    url: https://github.com/Nithishb03/emergency-blood-donar-finder
+    schedule_day: Wednesday
+    protected: false
+  - name: Health-Guard-Vision
+    url: https://github.com/Nithishb03/Health-Guard-Vision
+    schedule_day: Wednesday
+    protected: false
+  - name: IEH-AC
+    url: https://github.com/Nithishb03/IEH-AC
+    schedule_day: Thursday
+    protected: false
+  - name: Nithishb03
+    url: https://github.com/Nithishb03/Nithishb03
+    schedule_day: Thursday
+    protected: false
+  - name: picoCTF-writeups
+    url: https://github.com/Nithishb03/picoCTF-writeups
+    schedule_day: Friday
+    protected: false
+  - name: portfolio-
+    url: https://github.com/Nithishb03/portfolio-
+    schedule_day: Friday
+    protected: false
+  - name: project-comment-automation
+    url: https://github.com/Nithishb03/project-comment-automation
+    schedule_day: Friday
+    protected: true
+  - name: shiksha-sahayaka-RAG-
+    url: https://github.com/Nithishb03/shiksha-sahayaka-RAG-
+    schedule_day: Saturday
+    protected: false
+  - name: smart-parking-system
+    url: https://github.com/Nithishb03/smart-parking-system
+    schedule_day: Saturday
+    protected: false
+  - name: ZnO-piezoelectric-energy-harvesting
+    url: https://github.com/Nithishb03/ZnO-piezoelectric-energy-harvesting
+    schedule_day: Sunday
+    protected: false
