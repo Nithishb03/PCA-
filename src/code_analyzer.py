@@ -46,6 +46,8 @@ class _ElementVisitor(ast.NodeVisitor):
         is_method = bool(self.class_stack) and self.in_class_body
         parent_class = self.class_stack[-1] if is_method else None
         element_type = "method" if is_method else "function"
+        if isinstance(node, ast.AsyncFunctionDef) and not is_method:
+            element_type = "async_function"
         self.elements.append(_element_from_node(node, element_type, parent_class))
 
         for statement in node.body:

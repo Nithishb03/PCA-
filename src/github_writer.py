@@ -14,9 +14,11 @@ from urllib.parse import quote, unquote
 from urllib.request import Request, urlopen
 
 try:
+    from .documentation_policy import PROTECTED_PATH_PREFIXES, PROTECTED_PATHS
     from .github_manager import GitHubManager
     from .models import CommentGenerationResult, ValidatedChange, ValidationResult, WriteResult
 except ImportError:
+    from documentation_policy import PROTECTED_PATH_PREFIXES, PROTECTED_PATHS
     from github_manager import GitHubManager
     from models import CommentGenerationResult, ValidatedChange, ValidationResult, WriteResult
 
@@ -24,19 +26,6 @@ GITHUB_API_BASE_URL = "https://api.github.com"
 COMMIT_MESSAGE = "docs: update Python documentation"
 DEFAULT_MAX_DIFF_CHARS = 10000
 PROTECTED_REPOSITORY_NAMES = frozenset({"project-comment-automation"})
-PROTECTED_PATH_PREFIXES = (".github/", "config/")
-PROTECTED_PATHS = frozenset(
-    {
-        ".gitignore",
-        "requirements.txt",
-        "src/comment_generator.py",
-        "src/github_writer.py",
-        "src/github_manager.py",
-        "src/models.py",
-        "src/repository_manager.py",
-        "src/safety_validator.py",
-    }
-)
 
 
 class GitHubWriter:

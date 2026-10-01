@@ -71,7 +71,7 @@ def test_async_functions_are_detected():
     result = ANALYZER.analyze_python_file("async def fetch_data():\n    pass\n", "module.py")
 
     assert result.elements[0].name == "fetch_data"
-    assert result.elements[0].element_type == "function"
+    assert result.elements[0].element_type == "async_function"
     assert result.elements[0].needs_documentation is True
 
 

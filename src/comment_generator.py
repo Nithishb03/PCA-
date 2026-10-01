@@ -19,6 +19,12 @@ GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 SUPPORTED_ELEMENT_TYPES = frozenset({"function", "async_function", "class", "method"})
 LOGGER = logging.getLogger(__name__)
+ELEMENT_GUIDANCE = {
+    "function": "Describe the function's purpose and only explicit inputs, outputs, and side effects.",
+    "async_function": "Describe the asynchronous operation and only explicit inputs, outputs, and side effects.",
+    "class": "Describe the class responsibility and only the behavior and state evident in the source.",
+    "method": "Describe the method's role in its parent class and only explicit inputs, outputs, and side effects.",
+}
 
 
 class LLMProviderError(RuntimeError):
@@ -178,7 +184,7 @@ class CommentGenerator:
 
         prompt = self._build_prompt(source_code, code_element, context)
         try:
-            documentation = self._provider.generate(prompt).strip()
+            documentation = self._normalize_documentation(self._provider.generate(prompt))
         except LLMAuthenticationError:
             LOGGER.error("Documentation generation failed: Groq authentication error.")
             return CommentGenerationResult(success=False, error="LLM provider authentication failed")
@@ -195,14 +201,32 @@ class CommentGenerator:
             LOGGER.error("Documentation generation failed: unexpected provider error.")
             return CommentGenerationResult(success=False, error="LLM provider request failed")
 
-        if not documentation:
-            return CommentGenerationResult(success=False, error="LLM provider returned empty documentation")
-        if "```" in documentation:
-            return CommentGenerationResult(
-                success=False,
-                error="LLM provider returned malformed documentation",
-            )
         return CommentGenerationResult(success=True, documentation=documentation)
+
+    @staticmethod
+    def _normalize_documentation(documentation: Any) -> str:
+        """Normalize one provider response into usable docstring content."""
+        if not isinstance(documentation, str):
+            raise LLMResponseError("LLM provider returned non-text documentation")
+        normalized = documentation.strip()
+        if not normalized:
+            raise LLMResponseError("LLM provider returned empty documentation")
+
+        lines = normalized.splitlines()
+        if lines and lines[0].strip().startswith("```"):
+            if len(lines) < 3 or lines[-1].strip() != "```":
+                raise LLMResponseError("LLM provider returned malformed documentation")
+            normalized = "\n".join(lines[1:-1]).strip()
+        elif "```" in normalized:
+            raise LLMResponseError("LLM provider returned malformed documentation")
+
+        for quote in ('"""', "'''"):
+            if normalized.startswith(quote) and normalized.endswith(quote):
+                normalized = normalized[len(quote) : -len(quote)].strip()
+                break
+        if not normalized:
+            raise LLMResponseError("LLM provider returned empty documentation")
+        return normalized
 
     def _build_prompt(
         self,
@@ -212,11 +236,14 @@ class CommentGenerator:
     ) -> str:
         source_context = self._limit_source(source_code, code_element)
         extra_context = context.strip() if context else "No additional context provided."
+        element_guidance = ELEMENT_GUIDANCE[code_element.element_type]
         return f"""Generate documentation only for the specified code element.
 Understand the element before documenting it and describe only what the code actually does.
-Do not invent behavior, suggest implementation changes, or document unrelated code.
+    Use only facts supported by the supplied source and context. Do not invent parameters, return values, exceptions, side effects, or behavior.
+    Do not suggest implementation changes or document unrelated code.
 Keep the documentation concise and useful.
-Return only the documentation text. Do not return Markdown code fences or explanations outside the documentation.
+    {element_guidance}
+    Return only raw documentation text suitable for a Python docstring. Do not return Markdown code fences, surrounding quote delimiters, or explanations outside the documentation.
 
 Source:
 {source_context}

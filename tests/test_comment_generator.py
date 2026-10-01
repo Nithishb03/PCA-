@@ -107,13 +107,40 @@ def test_empty_provider_response_returns_failure():
     assert result.error == "LLM provider returned empty documentation"
 
 
-def test_malformed_markdown_response_returns_failure():
+def test_markdown_fence_is_removed_from_response():
     result = CommentGenerator(provider=FakeProvider("```python\npass\n```")).generate_documentation(
+        "source", make_element()
+    )
+
+    assert result.success is True
+    assert result.documentation == "pass"
+
+
+def test_surrounding_docstring_quotes_are_removed():
+    result = CommentGenerator(provider=FakeProvider('"""Useful documentation."""')).generate_documentation(
+        "source", make_element()
+    )
+
+    assert result.success is True
+    assert result.documentation == "Useful documentation."
+
+
+def test_unclosed_markdown_fence_returns_failure():
+    result = CommentGenerator(provider=FakeProvider("```python\npass")).generate_documentation(
         "source", make_element()
     )
 
     assert result.success is False
     assert result.error == "LLM provider returned malformed documentation"
+
+
+def test_non_text_response_returns_failure():
+    result = CommentGenerator(provider=FakeProvider(response=None)).generate_documentation(
+        "source", make_element()
+    )
+
+    assert result.success is False
+    assert result.error == "LLM provider returned non-text documentation"
 
 
 @pytest.mark.parametrize("element_type", ["function", "async_function", "class", "method"])
@@ -123,6 +150,26 @@ def test_supported_element_types_generate_documentation(element_type):
     )
 
     assert result.success is True
+
+
+@pytest.mark.parametrize("element_type", ["function", "async_function", "class", "method"])
+def test_prompt_contains_element_specific_metadata_and_guidance(element_type):
+    provider = FakeProvider()
+    element = make_element(element_type=element_type, name="target_element")
+
+    result = CommentGenerator(provider=provider).generate_documentation(
+        "def target_element(value):\n    return value\n",
+        element,
+        context="Only the supplied source is authoritative.",
+    )
+
+    assert result.success is True
+    prompt = provider.prompts[0]
+    assert "target_element" in prompt
+    assert f"element_type = {element_type}" in prompt
+    assert "Only the supplied source is authoritative." in prompt
+    assert "Do not invent parameters, return values, exceptions, side effects, or behavior." in prompt
+    assert "Return only raw documentation text suitable for a Python docstring." in prompt
 
 
 def test_private_element_is_skipped_without_calling_provider():

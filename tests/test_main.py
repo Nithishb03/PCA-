@@ -346,3 +346,40 @@ def test_generation_failure_does_not_stop_later_elements():
 	assert stats["generation_failures"] == 1
 	assert stats["generated"] == 1
 	assert stats["safe"] == 1
+
+
+def test_process_repository_applies_documentation_file_policy_before_fetching():
+	class PolicyGitHubManager(FakeGitHubManager):
+		def __init__(self):
+			self.fetched_paths = []
+
+		def get_directory(self, repository_url, path=""):
+			if not path:
+				return [
+					{"name": "tests", "type": "dir"},
+					{"name": "src", "type": "dir"},
+				]
+			return [
+				{"name": "module.py", "type": "file"},
+				{"name": "test_module.py", "type": "file"},
+				{"name": "generated_module.py", "type": "file"},
+			]
+
+		def get_file(self, repository_url, path):
+			self.fetched_paths.append(path)
+			return "def public_function():\n    return 1\n"
+
+	github_manager = PolicyGitHubManager()
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	stats = main_module._process_repository(
+		repository,
+		github_manager,
+		main_module.CodeAnalyzer(),
+		FakeGenerator(),
+		FakeValidator(),
+		FakeWriter(),
+	)
+
+	assert github_manager.fetched_paths == ["src/module.py"]
+	assert stats["files_examined"] == 1
+	assert stats["undocumented"] == 1

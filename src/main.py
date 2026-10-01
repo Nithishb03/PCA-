@@ -11,6 +11,7 @@ from typing import Any
 try:
 	from .code_analyzer import CodeAnalyzer
 	from .comment_generator import CommentGenerator
+	from .documentation_policy import DocumentationPolicy
 	from .github_manager import GitHubManager, GitHubManagerError
 	from .github_writer import GitHubWriter
 	from .models import CodeElement, DocumentationChange, Repository, ValidatedChange
@@ -19,6 +20,7 @@ try:
 except ImportError:
 	from code_analyzer import CodeAnalyzer
 	from comment_generator import CommentGenerator
+	from documentation_policy import DocumentationPolicy
 	from github_manager import GitHubManager, GitHubManagerError
 	from github_writer import GitHubWriter
 	from models import CodeElement, DocumentationChange, Repository, ValidatedChange
@@ -26,12 +28,14 @@ except ImportError:
 	from safety_validator import SafetyValidator
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "repositories.yml"
-IGNORED_DIRECTORIES = {".git", "venv", ".venv", "__pycache__", "generated"}
-MAX_ANALYZABLE_SOURCE_CHARS = 100000
-
-
-def _fetch_python_sources(github_manager: GitHubManager, repository_url: str, path: str = "") -> dict[str, str]:
+def _fetch_python_sources(
+	github_manager: GitHubManager,
+	repository_url: str,
+	path: str = "",
+	policy: DocumentationPolicy | None = None,
+) -> dict[str, str]:
 	"""Recursively fetch readable Python files through the read-only GitHub manager."""
+	policy = policy or DocumentationPolicy()
 	sources: dict[str, str] = {}
 	for entry in github_manager.get_directory(repository_url, path):
 		entry_name = entry.get("name")
@@ -40,9 +44,9 @@ def _fetch_python_sources(github_manager: GitHubManager, repository_url: str, pa
 			continue
 		entry_path = f"{path}/{entry_name}".strip("/")
 		if entry_type == "dir":
-			if entry_name not in IGNORED_DIRECTORIES:
-				sources.update(_fetch_python_sources(github_manager, repository_url, entry_path))
-		elif entry_type == "file" and entry_name.lower().endswith(".py"):
+			if policy.allows_directory(entry_path):
+				sources.update(_fetch_python_sources(github_manager, repository_url, entry_path, policy))
+		elif entry_type == "file" and policy.allows_file(entry_path):
 			sources[entry_path] = github_manager.get_file(repository_url, entry_path)
 	return sources
 
@@ -86,9 +90,11 @@ def _process_repository(
 	generator: CommentGenerator,
 	validator: SafetyValidator,
 	writer: GitHubWriter,
+	policy: DocumentationPolicy | None = None,
 ) -> dict[str, Any]:
 	"""Process one repository and isolate its failures from other repositories."""
 	stats = _new_repository_stats()
+	policy = policy or DocumentationPolicy()
 	try:
 		metadata = github_manager.get_repository(repository.url)
 		default_branch = github_manager.get_default_branch(repository.url)
@@ -99,12 +105,12 @@ def _process_repository(
 		print(f"Full name: {full_name}")
 		print(f"Default branch: {default_branch}")
 
-		fetched_sources = _fetch_python_sources(github_manager, repository.url)
+		fetched_sources = _fetch_python_sources(github_manager, repository.url, policy=policy)
 		stats["files_examined"] = len(fetched_sources)
 		sources = {
 			path: source
 			for path, source in fetched_sources.items()
-			if len(source) <= MAX_ANALYZABLE_SOURCE_CHARS
+			if policy.allows_file(path, len(source))
 		}
 		stats["files_skipped"] = len(fetched_sources) - len(sources)
 		stats["python_files"] = len(sources)
@@ -117,7 +123,7 @@ def _process_repository(
 				continue
 			source = sources[analysis_result.file_path]
 			for element in analysis_result.elements:
-				if not element.needs_documentation:
+				if not policy.allows_element(element):
 					continue
 				stats["undocumented"] += 1
 				generation = generator.generate_documentation(source, element)
