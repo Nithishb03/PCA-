@@ -28,6 +28,28 @@ except ImportError:
 	from safety_validator import SafetyValidator
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "repositories.yml"
+
+
+class CircuitBreaker:
+	"""Track consecutive availability/quota failures and open when threshold is reached."""
+
+	def __init__(self, max_consecutive_failures: int = 3) -> None:
+		self.max_consecutive_failures = max_consecutive_failures
+		self.consecutive_failures = 0
+		self.is_open = False
+
+	def record_success(self) -> None:
+		"""Reset consecutive failures upon a successful generation."""
+		self.consecutive_failures = 0
+
+	def record_failure(self, is_quota_or_availability: bool = True) -> None:
+		"""Record a failure; if quota/availability, increment count and open circuit if threshold met."""
+		if is_quota_or_availability:
+			self.consecutive_failures += 1
+			if self.consecutive_failures >= self.max_consecutive_failures:
+				self.is_open = True
+
+
 def _fetch_python_sources(
 	github_manager: GitHubManager,
 	repository_url: str,
@@ -74,10 +96,15 @@ def _new_repository_stats() -> dict[str, Any]:
 		"undocumented": 0,
 		"generated": 0,
 		"generation_failures": 0,
+		"rate_limited": 0,
+		"service_unavailable": 0,
+		"quota_deferred": 0,
 		"generation_error_reasons": [],
 		"safe": 0,
 		"unsafe": 0,
 		"rejected": 0,
+		"diffs_generated": 0,
+		"writes_attempted": 0,
 		"writes": 0,
 		"error": None,
 	}
@@ -91,10 +118,12 @@ def _process_repository(
 	validator: SafetyValidator,
 	writer: GitHubWriter,
 	policy: DocumentationPolicy | None = None,
+	circuit_breaker: CircuitBreaker | None = None,
 ) -> dict[str, Any]:
 	"""Process one repository and isolate its failures from other repositories."""
 	stats = _new_repository_stats()
 	policy = policy or DocumentationPolicy()
+	circuit_breaker = circuit_breaker or CircuitBreaker()
 	try:
 		metadata = github_manager.get_repository(repository.url)
 		default_branch = github_manager.get_default_branch(repository.url)
@@ -126,13 +155,35 @@ def _process_repository(
 				if not policy.allows_element(element):
 					continue
 				stats["undocumented"] += 1
-				generation = generator.generate_documentation(source, element)
-				if not generation.success:
-					stats["generation_failures"] += 1
-					reason = generation.error or "Unknown documentation generation failure."
+				if circuit_breaker.is_open:
+					stats["quota_deferred"] += 1
+					reason = "Gemini quota/availability circuit breaker open; request deferred."
 					if reason not in stats["generation_error_reasons"]:
 						stats["generation_error_reasons"].append(reason)
 					continue
+
+				generation = generator.generate_documentation(source, element)
+				if not generation.success:
+					error_type = getattr(generation, "error_type", None)
+					reason = generation.error or "Unknown documentation generation failure."
+					is_429 = error_type == "rate_limited" or "rate limit" in reason.lower()
+					is_503 = error_type == "service_unavailable" or "service availability" in reason.lower()
+
+					if is_429:
+						stats["rate_limited"] += 1
+						circuit_breaker.record_failure(is_quota_or_availability=True)
+					elif is_503:
+						stats["service_unavailable"] += 1
+						circuit_breaker.record_failure(is_quota_or_availability=True)
+					else:
+						stats["generation_failures"] += 1
+						circuit_breaker.record_failure(is_quota_or_availability=False)
+
+					if reason not in stats["generation_error_reasons"]:
+						stats["generation_error_reasons"].append(reason)
+					continue
+
+				circuit_breaker.record_success()
 				stats["generated"] += 1
 				try:
 					proposed_source = _build_proposed_source(
@@ -159,6 +210,8 @@ def _process_repository(
 					stats["rejected"] += 1
 					continue
 				stats["safe"] += 1
+				if validation.diff:
+					stats["diffs_generated"] += 1
 				print(f"\nProposed diff for {analysis_result.file_path}:{element.name}:")
 				print(validation.diff)
 				write_result = writer.write(
@@ -173,6 +226,8 @@ def _process_repository(
 						generation_result=generation,
 					)
 				)
+				if not write_result.dry_run:
+					stats["writes_attempted"] += 1
 				if write_result.success and not write_result.dry_run:
 					stats["writes"] += 1
 				elif not write_result.success:
@@ -193,8 +248,8 @@ def _print_repository_stats(repository: Repository, stats: dict[str, Any]) -> No
 	if stats["error"]:
 		print("Status: ERROR")
 		print(f"Reason: {stats['error']}")
-		return
-	print(f"Status: {stats['status']}")
+	else:
+		print(f"Status: {stats['status']}")
 	print(f"Files examined: {stats['files_examined']}")
 	print(f"Python files: {stats['python_files']}")
 	print(f"Files analyzed: {stats['files_analyzed']}")
@@ -202,12 +257,17 @@ def _print_repository_stats(repository: Repository, stats: dict[str, Any]) -> No
 	print(f"Undocumented elements: {stats['undocumented']}")
 	print(f"Generated documentation: {stats['generated']}")
 	print(f"Generation failures: {stats['generation_failures']}")
+	print(f"Rate limited: {stats['rate_limited']}")
+	print(f"Service unavailable: {stats['service_unavailable']}")
+	print(f"Quota deferred: {stats['quota_deferred']}")
 	for reason in stats["generation_error_reasons"]:
 		print(f"Generation reason: {reason}")
 	print(f"Safe changes: {stats['safe']}")
 	print(f"Unsafe changes rejected: {stats['unsafe']}")
-	print(f"Writes: {stats['writes']}")
-	print("Write: SKIPPED" if stats["status"] == "DRY RUN" else "Write: CONTROLLED")
+	print(f"Diffs generated: {stats['diffs_generated']}")
+	print(f"Writes attempted: {stats['writes_attempted']}")
+	print(f"Writes completed: {stats['writes']}")
+	print("Write: SKIPPED" if stats.get("status") == "DRY RUN" or stats.get("writes") == 0 else "Write: CONTROLLED")
 
 
 def main() -> None:
@@ -233,10 +293,15 @@ def main() -> None:
 		"undocumented": 0,
 		"generated": 0,
 		"generation_failures": 0,
+		"rate_limited": 0,
+		"service_unavailable": 0,
+		"quota_deferred": 0,
 		"generation_error_reasons": [],
 		"safe": 0,
 		"unsafe": 0,
 		"rejected": 0,
+		"diffs_generated": 0,
+		"writes_attempted": 0,
 		"writes": 0,
 	}
 	if not os.getenv("GITHUB_TOKEN"):
@@ -252,13 +317,24 @@ def main() -> None:
 	generator = CommentGenerator()
 	validator = SafetyValidator()
 	writer = GitHubWriter()
-	if not os.getenv("GROQ_API_KEY"):
-		print("\nLLM generation skipped because GROQ_API_KEY is unavailable.")
+	provider_name = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+	provider_key_name = "GROQ_API_KEY" if provider_name == "groq" else "GEMINI_API_KEY"
+	if not os.getenv(provider_key_name):
+		print(f"\nLLM generation skipped because {provider_key_name} is unavailable.")
 	if not writer.write_enabled:
 		print("GitHub write mode disabled; running in dry-run mode.")
 
+	circuit_breaker = CircuitBreaker()
 	for repository in repositories:
-		stats = _process_repository(repository, github_manager, analyzer, generator, validator, writer)
+		stats = _process_repository(
+			repository,
+			github_manager,
+			analyzer,
+			generator,
+			validator,
+			writer,
+			circuit_breaker=circuit_breaker,
+		)
 		_print_repository_stats(repository, stats)
 		if stats["error"]:
 			summary["failed"] += 1
@@ -272,9 +348,14 @@ def main() -> None:
 			"undocumented",
 			"generated",
 			"generation_failures",
+			"rate_limited",
+			"service_unavailable",
+			"quota_deferred",
 			"safe",
 			"unsafe",
 			"rejected",
+			"diffs_generated",
+			"writes_attempted",
 			"writes",
 		):
 			summary[key] += stats[key]
@@ -297,11 +378,16 @@ def _print_summary(summary: dict[str, int], scheduled: int, writes_enabled: bool
 	print(f"Undocumented elements: {summary['undocumented']}")
 	print(f"Documentation generated: {summary['generated']}")
 	print(f"Generation failures: {summary['generation_failures']}")
+	print(f"Rate limited: {summary['rate_limited']}")
+	print(f"Service unavailable: {summary['service_unavailable']}")
+	print(f"Quota deferred: {summary['quota_deferred']}")
 	for reason in summary["generation_error_reasons"]:
 		print(f"Generation reason: {reason}")
 	print(f"Safe proposed changes: {summary['safe']}")
 	print(f"Unsafe changes rejected: {summary['unsafe']}")
 	print(f"Rejected changes: {summary['rejected']}")
+	print(f"Diffs generated: {summary['diffs_generated']}")
+	print(f"Writes attempted: {summary['writes_attempted']}")
 	print(f"Writes completed: {summary['writes']}")
 	print("GitHub writes: ENABLED" if writes_enabled else "GitHub writes: DISABLED / DRY RUN")
 

@@ -1,1 +1,2 @@
 PyYAML>=6.0,<7.0
+google-genai>=1.0,<3.0

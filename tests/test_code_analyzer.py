@@ -143,3 +143,18 @@ def test_multiple_file_api_ignores_non_python_and_excluded_paths():
     )
 
     assert [result.file_path for result in results] == ["module.py"]
+
+
+def test_nested_function_in_documented_function_not_duplicated():
+    source = (
+        'def extract_features(events):\n'
+        '    """Compute behavioral features."""\n'
+        '    def count_of(t):\n'
+        '        return sum(1 for e in events if e["type"] == t)\n'
+        '    return count_of("click")\n'
+    )
+    result = ANALYZER.analyze_python_file(source, "ml_pipeline/feature_extractor.py")
+    element_names = [e.name for e in result.elements]
+    assert element_names == ["extract_features", "count_of"]
+    assert element_names.count("count_of") == 1
+

@@ -18,13 +18,18 @@ Repository names, URLs, protection flags, and temporary schedule days live in `c
 
 The workflow supports manual `workflow_dispatch` runs and a daily schedule. It uses Python 3.12 and installs the minimal dependency listed in `requirements.txt`.
 
+The provider abstraction defaults to Gemini. Set `LLM_PROVIDER=groq` only when using the backward-compatible Groq provider.
+
 Required GitHub Actions environment values are supplied through secrets:
 
 - `GITHUB_TOKEN`: the built-in token used for read-only repository access.
-- `GROQ_API_KEY`: optional repository secret used for documentation generation.
+- `LLM_PROVIDER`: `gemini` in the production workflow.
+- `GEMINI_API_KEY`: repository secret used by the official `google-genai` SDK.
+- `GEMINI_MODEL`: optional model override; the workflow uses the stable `gemini-3.8-flash` model.
+- `GROQ_API_KEY`: optional repository secret when `LLM_PROVIDER=groq`.
 - `GITHUB_WRITE_ENABLED`: explicitly set to `false` in the workflow.
 
-The workflow runs safely without `GROQ_API_KEY`; generation is skipped and read-only work continues when GitHub access is available.
+The workflow runs safely without `GEMINI_API_KEY`; generation is skipped and read-only work continues when GitHub access is available. No API key belongs in source code, configuration, or this README.
 
 ## Safety
 

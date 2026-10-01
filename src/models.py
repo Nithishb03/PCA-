@@ -48,6 +48,7 @@ class CommentGenerationResult:
     success: bool
     documentation: Optional[str] = None
     error: Optional[str] = None
+    error_type: Optional[str] = None
 
 
 @dataclass(frozen=True)

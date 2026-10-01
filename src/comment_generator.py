@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import time
 from collections.abc import Callable
 from typing import Any, Optional, Protocol
 from urllib.error import HTTPError, URLError
@@ -17,6 +19,10 @@ except ImportError:
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_REQUEST_INTERVAL_SECONDS = 4.0
+DEFAULT_GEMINI_MAX_RETRIES = 2
+DEFAULT_GEMINI_RETRY_BASE_SECONDS = 5.0
 SUPPORTED_ELEMENT_TYPES = frozenset({"function", "async_function", "class", "method"})
 LOGGER = logging.getLogger(__name__)
 ELEMENT_GUIDANCE = {
@@ -47,6 +53,10 @@ class LLMResponseError(LLMProviderError):
     """Raised when the provider response is missing usable documentation."""
 
 
+class LLMServiceUnavailableError(LLMProviderError):
+    """Raised when the provider is temporarily unavailable or experiencing high demand."""
+
+
 class LLMProvider(Protocol):
     """Interface required by CommentGenerator for any LLM provider."""
 
@@ -55,8 +65,191 @@ class LLMProvider(Protocol):
         ...
 
 
+class GeminiProvider:
+    """Google Gemini provider using the official google-genai SDK."""
+
+    provider_name = "Gemini"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        client: Optional[Any] = None,
+        request_interval: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        retry_base_seconds: Optional[float] = None,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
+    ) -> None:
+        self._api_key = api_key or os.getenv("GEMINI_API_KEY")
+        if not self._api_key:
+            LOGGER.warning("Gemini API key unavailable to Python.")
+            raise MissingLLMAPIKeyError(
+                "LLM generation requires the GEMINI_API_KEY environment variable."
+            )
+        self.model = model or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
+        if request_interval is not None:
+            self.request_interval = float(request_interval)
+        else:
+            env_interval = os.getenv("GEMINI_REQUEST_INTERVAL_SECONDS")
+            try:
+                self.request_interval = (
+                    float(env_interval)
+                    if env_interval is not None
+                    else DEFAULT_GEMINI_REQUEST_INTERVAL_SECONDS
+                )
+            except (ValueError, TypeError):
+                self.request_interval = DEFAULT_GEMINI_REQUEST_INTERVAL_SECONDS
+
+        if max_retries is not None:
+            self.max_retries = int(max_retries)
+        else:
+            env_retries = os.getenv("GEMINI_MAX_RETRIES")
+            try:
+                self.max_retries = (
+                    int(env_retries)
+                    if env_retries is not None
+                    else DEFAULT_GEMINI_MAX_RETRIES
+                )
+            except (ValueError, TypeError):
+                self.max_retries = DEFAULT_GEMINI_MAX_RETRIES
+        if self.max_retries < 0:
+            self.max_retries = 0
+
+        if retry_base_seconds is not None:
+            self.retry_base_seconds = float(retry_base_seconds)
+        else:
+            env_base = os.getenv("GEMINI_RETRY_BASE_SECONDS")
+            try:
+                self.retry_base_seconds = (
+                    float(env_base)
+                    if env_base is not None
+                    else DEFAULT_GEMINI_RETRY_BASE_SECONDS
+                )
+            except (ValueError, TypeError):
+                self.retry_base_seconds = DEFAULT_GEMINI_RETRY_BASE_SECONDS
+        if self.retry_base_seconds < 0:
+            self.retry_base_seconds = 0.0
+
+        self._clock = clock or time.monotonic
+        self._sleeper = sleeper or time.sleep
+        self._last_request_start: Optional[float] = None
+
+        if client is None:
+            try:
+                from google import genai
+            except ImportError as error:
+                raise LLMProviderError("Gemini SDK is unavailable.") from error
+            client = genai.Client(api_key=self._api_key)
+        self._client = client
+        LOGGER.info(
+            "Gemini provider initialized with model %s (max_retries=%d, retry_base=%.1fs).",
+            self.model,
+            self.max_retries,
+            self.retry_base_seconds,
+        )
+
+    def generate(self, prompt: str) -> str:
+        """Generate documentation with one Gemini request, retrying temporary 503 errors."""
+        max_retries = max(0, self.max_retries)
+        total_attempts = 1 + max_retries
+
+        for attempt in range(total_attempts):
+            now = self._clock()
+            if self._last_request_start is not None and self.request_interval > 0:
+                elapsed = now - self._last_request_start
+                wait_time = self.request_interval - elapsed
+                if wait_time > 0:
+                    self._sleeper(wait_time)
+                    now = self._clock()
+
+            self._last_request_start = now
+            LOGGER.info("Gemini request started.")
+            try:
+                response = self._client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config={"automatic_function_calling": {"disable": True}},
+                )
+            except Exception as error:
+                status_code = getattr(error, "status_code", getattr(error, "code", None))
+                error_name = type(error).__name__.lower()
+                if status_code in {401, 403} or "auth" in error_name:
+                    LOGGER.error("Gemini request returned an authentication error.")
+                    raise LLMAuthenticationError("LLM provider authentication failed") from None
+                if status_code == 429 or "rate" in error_name:
+                    LOGGER.error("Gemini request returned a rate-limit error.")
+                    raise LLMRateLimitError("LLM provider rate limit reached") from None
+                if isinstance(error, (TimeoutError, URLError, OSError, ConnectionError)):
+                    LOGGER.error("Gemini request returned a network error.")
+                    raise LLMProviderError("Unable to reach the LLM provider") from None
+                diagnostic = self._safe_error_detail(error)
+                status = getattr(error, "status", None)
+                status_str = str(status).upper() if status is not None else ""
+                if (
+                    status_code in {503, "503"}
+                    or status_str == "UNAVAILABLE"
+                    or "unavailable" in error_name
+                    or "503" in error_name
+                ):
+                    if attempt < max_retries:
+                        backoff = self.retry_base_seconds * (2 ** attempt)
+                        LOGGER.warning(
+                            "Gemini request returned temporary service availability error (503); "
+                            "retrying in %.1fs (attempt %d of %d): %s",
+                            backoff,
+                            attempt + 1,
+                            max_retries,
+                            diagnostic,
+                        )
+                        if backoff > 0:
+                            self._sleeper(backoff)
+                        continue
+
+                    LOGGER.error(
+                        "Gemini request returned a temporary service availability error: %s",
+                        diagnostic,
+                    )
+                    raise LLMServiceUnavailableError(diagnostic) from None
+
+                LOGGER.error("Gemini request returned an API error: %s", diagnostic)
+                raise LLMProviderError(diagnostic) from None
+
+            documentation = getattr(response, "text", None)
+            if not isinstance(documentation, str):
+                LOGGER.error("Gemini response parsing failed: non-text response.")
+                raise LLMResponseError("LLM provider returned non-text documentation")
+            if not documentation.strip():
+                LOGGER.error("Gemini response parsing failed: empty response.")
+                raise LLMResponseError("LLM provider returned empty documentation")
+            LOGGER.info("Gemini request succeeded and documentation was generated.")
+            return documentation
+
+    @staticmethod
+    def _safe_error_detail(error: Exception) -> str:
+        """Return bounded SDK error metadata with credential-like values removed."""
+        status_code = getattr(error, "status_code", getattr(error, "code", None))
+        status = getattr(error, "status", None)
+        message = getattr(error, "message", None) or str(error)
+        message = re.sub(r"AIza[0-9A-Za-z_-]+|gsk_[0-9A-Za-z_-]+", "[redacted]", message)
+        message = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", message)
+        message = re.sub(r"(?i)(api[-_ ]?key|authorization)\s*[:=]\s*\S+", r"\1=[redacted]", message)
+        message = re.sub(r"https?://\S+", "[url]", message)
+        message = " ".join(message.split())[:300]
+        details = [type(error).__name__]
+        if status_code is not None:
+            details.append(f"status={status_code}")
+        if status:
+            details.append(f"reason={status}")
+        if message:
+            details.append(message)
+        return ": ".join(details)
+
+
 class GroqProvider:
     """Minimal read-only Groq chat-completions client."""
+
+    provider_name = "Groq"
 
     def __init__(
         self,
@@ -149,6 +342,11 @@ class CommentGenerator:
         api_key: Optional[str] = None,
         model: Optional[str] = None,
         max_source_chars: int = 12000,
+        request_interval: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        retry_base_seconds: Optional[float] = None,
+        clock: Optional[Callable[[], float]] = None,
+        sleeper: Optional[Callable[[float], None]] = None,
     ) -> None:
         if max_source_chars < 1:
             raise ValueError("max_source_chars must be greater than zero")
@@ -157,10 +355,31 @@ class CommentGenerator:
         self._provider_error: Optional[str] = None
         if provider is None:
             try:
-                self._provider = GroqProvider(api_key=api_key, model=model)
+                provider_name = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+                if provider_name == "groq":
+                    self._provider = GroqProvider(api_key=api_key, model=model)
+                elif provider_name == "gemini":
+                    gemini_kwargs: dict[str, Any] = {}
+                    if request_interval is not None:
+                        gemini_kwargs["request_interval"] = request_interval
+                    if max_retries is not None:
+                        gemini_kwargs["max_retries"] = max_retries
+                    if retry_base_seconds is not None:
+                        gemini_kwargs["retry_base_seconds"] = retry_base_seconds
+                    if clock is not None:
+                        gemini_kwargs["clock"] = clock
+                    if sleeper is not None:
+                        gemini_kwargs["sleeper"] = sleeper
+                    self._provider = GeminiProvider(
+                        api_key=api_key,
+                        model=model,
+                        **gemini_kwargs,
+                    )
+                else:
+                    self._provider_error = f"Unsupported LLM_PROVIDER: {provider_name}"
             except MissingLLMAPIKeyError as error:
                 self._provider_error = str(error)
-                LOGGER.warning("CommentGenerator cannot call Groq because the API key is unavailable.")
+                LOGGER.warning("CommentGenerator cannot call the selected LLM provider because its API key is unavailable.")
 
     def generate_documentation(
         self,
@@ -186,20 +405,55 @@ class CommentGenerator:
         try:
             documentation = self._normalize_documentation(self._provider.generate(prompt))
         except LLMAuthenticationError:
-            LOGGER.error("Documentation generation failed: Groq authentication error.")
-            return CommentGenerationResult(success=False, error="LLM provider authentication failed")
+            LOGGER.error("Documentation generation failed: provider authentication error.")
+            return CommentGenerationResult(
+                success=False,
+                error="LLM provider authentication failed",
+                error_type="authentication",
+            )
         except LLMRateLimitError:
-            LOGGER.error("Documentation generation failed: Groq rate-limit error.")
-            return CommentGenerationResult(success=False, error="LLM provider rate limit reached")
+            LOGGER.error("Documentation generation failed: provider rate-limit error.")
+            return CommentGenerationResult(
+                success=False,
+                error="LLM provider rate limit reached",
+                error_type="rate_limited",
+            )
+        except LLMServiceUnavailableError as error:
+            provider_name = getattr(self._provider, "provider_name", "LLM")
+            error_detail = str(error)
+            LOGGER.error(
+                "Documentation generation failed: %s temporary service availability error.",
+                provider_name,
+            )
+            result_error = f"temporary {provider_name} service availability failure"
+            if error_detail:
+                result_error = f"{result_error}: {error_detail}"
+            return CommentGenerationResult(
+                success=False,
+                error=result_error,
+                error_type="service_unavailable",
+            )
         except LLMResponseError as error:
-            LOGGER.error("Documentation generation failed: Groq response error.")
+            LOGGER.error("Documentation generation failed: provider response error.")
             return CommentGenerationResult(success=False, error=str(error))
-        except LLMProviderError:
-            LOGGER.error("Documentation generation failed: Groq provider error.")
-            return CommentGenerationResult(success=False, error="LLM provider request failed")
+        except LLMProviderError as error:
+            provider_name = getattr(self._provider, "provider_name", "LLM")
+            error_detail = str(error)
+            LOGGER.error("Documentation generation failed: %s provider error.", provider_name)
+            result_error = f"{provider_name} provider request failed"
+            if provider_name == "Gemini" and error_detail:
+                result_error = f"{result_error}: {error_detail}"
+            return CommentGenerationResult(
+                success=False,
+                error=result_error,
+            )
         except Exception:
-            LOGGER.error("Documentation generation failed: unexpected provider error.")
-            return CommentGenerationResult(success=False, error="LLM provider request failed")
+            provider_name = getattr(self._provider, "provider_name", "LLM")
+            LOGGER.error("Documentation generation failed: unexpected %s provider error.", provider_name)
+            return CommentGenerationResult(
+                success=False,
+                error=f"{provider_name} provider request failed",
+            )
 
         return CommentGenerationResult(success=True, documentation=documentation)
 
@@ -240,6 +494,8 @@ class CommentGenerator:
         return f"""Generate documentation only for the specified code element.
 Understand the element before documenting it and describe only what the code actually does.
     Use only facts supported by the supplied source and context. Do not invent parameters, return values, exceptions, side effects, or behavior.
+    Inspect the actual return statement(s) and describe the actual returned variable or value semantics from the supplied source code.
+    Do not invent return names or replace returned variables or values with raw implementation expressions (such as len(files)); describe the semantic meaning of the returned values (e.g. total_files or count of files) rather than using code expressions as variable names.
     Do not suggest implementation changes or document unrelated code.
 Keep the documentation concise and useful.
     {element_guidance}

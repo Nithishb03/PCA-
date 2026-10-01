@@ -383,3 +383,381 @@ def test_process_repository_applies_documentation_file_policy_before_fetching():
 	assert github_manager.fetched_paths == ["src/module.py"]
 	assert stats["files_examined"] == 1
 	assert stats["undocumented"] == 1
+
+
+def test_circuit_breaker_consecutive_failures_and_reset():
+	cb = main_module.CircuitBreaker(max_consecutive_failures=3)
+	assert not cb.is_open
+
+	cb.record_failure(is_quota_or_availability=True)
+	assert cb.consecutive_failures == 1
+	assert not cb.is_open
+
+	cb.record_failure(is_quota_or_availability=True)
+	assert cb.consecutive_failures == 2
+	assert not cb.is_open
+
+	# Non-quota failure does not increment consecutive 429/503 count
+	cb.record_failure(is_quota_or_availability=False)
+	assert cb.consecutive_failures == 2
+	assert not cb.is_open
+
+	# Successful request resets consecutive count
+	cb.record_success()
+	assert cb.consecutive_failures == 0
+	assert not cb.is_open
+
+	# 3 consecutive 429/503 failures open the circuit
+	cb.record_failure(is_quota_or_availability=True)
+	cb.record_failure(is_quota_or_availability=True)
+	cb.record_failure(is_quota_or_availability=True)
+	assert cb.consecutive_failures == 3
+	assert cb.is_open
+
+
+def test_process_repository_records_429_rate_limited():
+	class RateLimitGenerator:
+		def generate_documentation(self, source, element):
+			return CommentGenerationResult(
+				success=False,
+				error="LLM provider rate limit reached",
+				error_type="rate_limited",
+			)
+
+	class SingleFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return "def only_fn():\n    return 1\n"
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	stats = main_module._process_repository(
+		repository,
+		SingleFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		RateLimitGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+	)
+
+	assert stats["undocumented"] == 1
+	assert stats["rate_limited"] == 1
+	assert stats["service_unavailable"] == 0
+	assert stats["generation_failures"] == 0
+	assert stats["quota_deferred"] == 0
+
+
+def test_process_repository_records_503_service_unavailable():
+	class ServiceUnavailableGenerator:
+		def generate_documentation(self, source, element):
+			return CommentGenerationResult(
+				success=False,
+				error="temporary Gemini service availability failure: status=503 reason=UNAVAILABLE",
+				error_type="service_unavailable",
+			)
+
+	class SingleFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return "def only_fn():\n    return 1\n"
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	stats = main_module._process_repository(
+		repository,
+		SingleFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		ServiceUnavailableGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+	)
+
+	assert stats["undocumented"] == 1
+	assert stats["service_unavailable"] == 1
+	assert stats["rate_limited"] == 0
+	assert stats["generation_failures"] == 0
+	assert stats["quota_deferred"] == 0
+
+
+def test_process_repository_circuit_breaker_defers_after_three_failures():
+	calls = []
+
+	class SequenceGenerator:
+		def generate_documentation(self, source, element):
+			calls.append(element.name)
+			if element.name in ("fn1", "fn2"):
+				return CommentGenerationResult(
+					success=False,
+					error="LLM provider rate limit reached",
+					error_type="rate_limited",
+				)
+			if element.name == "fn3":
+				return CommentGenerationResult(
+					success=False,
+					error="temporary Gemini service availability failure: status=503",
+					error_type="service_unavailable",
+				)
+			return CommentGenerationResult(
+				success=True,
+				documentation="Doc",
+			)
+
+	class FiveFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return (
+				"def fn1():\n    return 1\n\n"
+				"def fn2():\n    return 2\n\n"
+				"def fn3():\n    return 3\n\n"
+				"def fn4():\n    return 4\n\n"
+				"def fn5():\n    return 5\n"
+			)
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	circuit_breaker = main_module.CircuitBreaker(max_consecutive_failures=3)
+
+	stats = main_module._process_repository(
+		repository,
+		FiveFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		SequenceGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+		circuit_breaker=circuit_breaker,
+	)
+
+	assert stats["undocumented"] == 5
+	assert stats["rate_limited"] == 2
+	assert stats["service_unavailable"] == 1
+	assert stats["quota_deferred"] == 2
+	assert stats["generation_failures"] == 0
+	assert stats["generated"] == 0
+	assert circuit_breaker.is_open is True
+	# After circuit opened on 3rd failure, fn4 and fn5 were NOT requested
+	assert calls == ["fn1", "fn2", "fn3"]
+
+
+def test_normal_generation_failure_does_not_open_circuit():
+	class NormalFailureGenerator:
+		def generate_documentation(self, source, element):
+			return CommentGenerationResult(
+				success=False,
+				error="LLM provider returned empty documentation",
+			)
+
+	class ThreeFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return (
+				"def fn1():\n    return 1\n\n"
+				"def fn2():\n    return 2\n\n"
+				"def fn3():\n    return 3\n"
+			)
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	circuit_breaker = main_module.CircuitBreaker(max_consecutive_failures=3)
+
+	stats = main_module._process_repository(
+		repository,
+		ThreeFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		NormalFailureGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+		circuit_breaker=circuit_breaker,
+	)
+
+	assert stats["undocumented"] == 3
+	assert stats["generation_failures"] == 3
+	assert stats["rate_limited"] == 0
+	assert stats["service_unavailable"] == 0
+	assert stats["quota_deferred"] == 0
+	assert circuit_breaker.is_open is False
+
+
+def test_success_resets_consecutive_failures_preventing_circuit_open():
+	class IntermittentGenerator:
+		def generate_documentation(self, source, element):
+			if element.name in ("fn1", "fn2"):
+				return CommentGenerationResult(
+					success=False,
+					error="LLM provider rate limit reached",
+					error_type="rate_limited",
+				)
+			if element.name == "fn3":
+				# Success resets consecutive failure count
+				return CommentGenerationResult(
+					success=True,
+					documentation="Document fn3",
+				)
+			if element.name == "fn4":
+				return CommentGenerationResult(
+					success=False,
+					error="LLM provider rate limit reached",
+					error_type="rate_limited",
+				)
+			return CommentGenerationResult(
+				success=True,
+				documentation="Document fn5",
+			)
+
+	class FiveFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return (
+				"def fn1():\n    return 1\n\n"
+				"def fn2():\n    return 2\n\n"
+				"def fn3():\n    return 3\n\n"
+				"def fn4():\n    return 4\n\n"
+				"def fn5():\n    return 5\n"
+			)
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	circuit_breaker = main_module.CircuitBreaker(max_consecutive_failures=3)
+
+	stats = main_module._process_repository(
+		repository,
+		FiveFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		IntermittentGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+		circuit_breaker=circuit_breaker,
+	)
+
+	assert stats["undocumented"] == 5
+	assert stats["rate_limited"] == 3
+	assert stats["generated"] == 2
+	assert stats["quota_deferred"] == 0
+	assert circuit_breaker.is_open is False
+
+
+def test_circuit_breaker_works_after_retries_are_exhausted():
+	class ExhaustedRetriesGenerator:
+		def generate_documentation(self, source, element):
+			if element.name in ("fn1", "fn2", "fn3"):
+				return CommentGenerationResult(
+					success=False,
+					error="temporary Gemini service availability failure: status=503",
+					error_type="service_unavailable",
+				)
+			return CommentGenerationResult(
+				success=True,
+				documentation="Doc",
+			)
+
+	class FourFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return (
+				"def fn1():\n    return 1\n\n"
+				"def fn2():\n    return 2\n\n"
+				"def fn3():\n    return 3\n\n"
+				"def fn4():\n    return 4\n"
+			)
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	circuit_breaker = main_module.CircuitBreaker(max_consecutive_failures=3)
+
+	stats = main_module._process_repository(
+		repository,
+		FourFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		ExhaustedRetriesGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+		circuit_breaker=circuit_breaker,
+	)
+
+	assert stats["undocumented"] == 4
+	assert stats["service_unavailable"] == 3
+	assert stats["quota_deferred"] == 1
+	assert stats["generated"] == 0
+	assert circuit_breaker.is_open is True
+
+
+def test_successful_retry_resets_consecutive_failure_state():
+	class RetrySuccessGenerator:
+		def generate_documentation(self, source, element):
+			if element.name in ("fn1", "fn3", "fn4"):
+				return CommentGenerationResult(
+					success=False,
+					error="temporary Gemini service availability failure: status=503",
+					error_type="service_unavailable",
+				)
+			return CommentGenerationResult(
+				success=True,
+				documentation="Documented fn2 after retry",
+			)
+
+	class FourFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return (
+				"def fn1():\n    return 1\n\n"
+				"def fn2():\n    return 2\n\n"
+				"def fn3():\n    return 3\n\n"
+				"def fn4():\n    return 4\n"
+			)
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	circuit_breaker = main_module.CircuitBreaker(max_consecutive_failures=3)
+
+	stats = main_module._process_repository(
+		repository,
+		FourFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		RetrySuccessGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+		circuit_breaker=circuit_breaker,
+	)
+
+	assert stats["undocumented"] == 4
+	assert stats["service_unavailable"] == 3
+	assert stats["generated"] == 1
+	assert stats["quota_deferred"] == 0
+	assert circuit_breaker.is_open is False
+	assert circuit_breaker.consecutive_failures == 2
+
+
+def test_process_repository_nested_function_diff_not_duplicated(capsys):
+	class NestedFunctionGitHubManager(FakeGitHubManager):
+		def get_directory(self, repository_url, path=""):
+			if not path:
+				return [{"name": "ml_pipeline", "type": "dir"}]
+			if path == "ml_pipeline":
+				return [{"name": "feature_extractor.py", "type": "file"}]
+			return []
+
+		def get_file(self, repository_url, path):
+			return (
+				'def extract_features(events):\n'
+				'    """Outer documented function."""\n'
+				'    def count_of(t):\n'
+				'        return sum(1 for e in events if e["type"] == t)\n'
+				'    return count_of("click")\n'
+			)
+
+	calls = []
+
+	class TrackingGenerator:
+		def generate_documentation(self, source, element):
+			calls.append(element.name)
+			return CommentGenerationResult(
+				success=True,
+				documentation="Count occurrences of event type in events list.",
+			)
+
+	repository = Repository("IEH-AC", "https://github.com/Nithishb03/IEH-AC", "thursday", False)
+	stats = main_module._process_repository(
+		repository,
+		NestedFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		TrackingGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+	)
+
+	assert stats["undocumented"] == 1
+	assert stats["generated"] == 1
+	assert stats["safe"] == 1
+	assert calls == ["count_of"]
+
+	captured = capsys.readouterr().out
+	header = "Proposed diff for ml_pipeline/feature_extractor.py:count_of"
+	assert captured.count(header) == 1
+
+
+
