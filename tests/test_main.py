@@ -154,6 +154,14 @@ class CountingGenerator(FakeGenerator):
 		return super().generate_documentation(source, element)
 
 
+class FailingGenerator:
+	def generate_documentation(self, source, element):
+		return CommentGenerationResult(
+			success=False,
+			error="LLM generation requires the GROQ_API_KEY environment variable.",
+		)
+
+
 class FakeValidator:
 	def validate(self, change):
 		return ValidationResult(safe=True, diff="safe diff")
@@ -252,3 +260,22 @@ def test_process_repository_does_not_regenerate_existing_documentation():
 	assert stats["undocumented"] == 0
 	assert stats["generated"] == 0
 	assert generator.calls == 0
+
+
+def test_process_repository_reports_generation_failure_reason():
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	stats = main_module._process_repository(
+		repository,
+		FakeGitHubManager(),
+		main_module.CodeAnalyzer(),
+		FailingGenerator(),
+		FakeValidator(),
+		FakeWriter(),
+	)
+
+	assert stats["undocumented"] == 1
+	assert stats["generated"] == 0
+	assert stats["generation_failures"] == 1
+	assert stats["generation_error_reasons"] == [
+		"LLM generation requires the GROQ_API_KEY environment variable."
+	]

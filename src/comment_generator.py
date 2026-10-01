@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Callable
 from typing import Any, Optional, Protocol
@@ -17,6 +18,7 @@ except ImportError:
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 SUPPORTED_ELEMENT_TYPES = frozenset({"function", "async_function", "class", "method"})
+LOGGER = logging.getLogger(__name__)
 
 
 class LLMProviderError(RuntimeError):
@@ -59,12 +61,14 @@ class GroqProvider:
     ) -> None:
         self._api_key = api_key or os.getenv("GROQ_API_KEY")
         if not self._api_key:
+            LOGGER.warning("Groq API key unavailable to Python.")
             raise MissingLLMAPIKeyError(
                 "LLM generation requires the GROQ_API_KEY environment variable."
             )
         self.model = model or os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL
         self.timeout = timeout
         self._opener = opener or urlopen
+        LOGGER.info("Groq API key available; provider initialized with model %s.", self.model)
 
     def generate(self, prompt: str) -> str:
         request_body = {
@@ -82,37 +86,50 @@ class GroqProvider:
             },
             method="POST",
         )
+        LOGGER.info("Groq request started.")
         try:
             with self._opener(request, timeout=self.timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             if error.code in {401, 403}:
+                LOGGER.error("Groq request returned an authentication error.")
                 raise LLMAuthenticationError("LLM provider authentication failed") from error
             if error.code == 429:
+                LOGGER.error("Groq request returned a rate-limit error.")
                 raise LLMRateLimitError("LLM provider rate limit reached") from error
+            LOGGER.error("Groq request returned an API error.")
             raise LLMProviderError(f"LLM provider returned HTTP {error.code}") from error
         except (URLError, TimeoutError, OSError):
+            LOGGER.error("Groq request returned a network error.")
             raise LLMProviderError("Unable to reach the LLM provider") from None
         except (json.JSONDecodeError, UnicodeDecodeError):
+            LOGGER.error("Groq request succeeded but response parsing failed.")
             raise LLMResponseError("LLM provider returned malformed JSON") from None
 
-        return self._extract_documentation(payload)
+        documentation = self._extract_documentation(payload)
+        LOGGER.info("Groq request succeeded and documentation was generated.")
+        return documentation
 
     @staticmethod
     def _extract_documentation(payload: Any) -> str:
         if not isinstance(payload, dict):
+            LOGGER.error("Groq response parsing failed: malformed response.")
             raise LLMResponseError("LLM provider returned a malformed response")
         choices = payload.get("choices")
         if not isinstance(choices, list) or not choices:
+            LOGGER.error("Groq response parsing failed: no completion choices.")
             raise LLMResponseError("LLM provider returned no completion choices")
         first_choice = choices[0]
         if not isinstance(first_choice, dict):
+            LOGGER.error("Groq response parsing failed: malformed completion.")
             raise LLMResponseError("LLM provider returned a malformed completion")
         message = first_choice.get("message")
         if not isinstance(message, dict):
+            LOGGER.error("Groq response parsing failed: malformed message.")
             raise LLMResponseError("LLM provider returned a malformed message")
         documentation = message.get("content")
         if not isinstance(documentation, str) or not documentation.strip():
+            LOGGER.error("Groq response parsing failed: empty documentation.")
             raise LLMResponseError("LLM provider returned empty documentation")
         return documentation.strip()
 
@@ -137,6 +154,7 @@ class CommentGenerator:
                 self._provider = GroqProvider(api_key=api_key, model=model)
             except MissingLLMAPIKeyError as error:
                 self._provider_error = str(error)
+                LOGGER.warning("CommentGenerator cannot call Groq because the API key is unavailable.")
 
     def generate_documentation(
         self,
@@ -162,14 +180,19 @@ class CommentGenerator:
         try:
             documentation = self._provider.generate(prompt).strip()
         except LLMAuthenticationError:
+            LOGGER.error("Documentation generation failed: Groq authentication error.")
             return CommentGenerationResult(success=False, error="LLM provider authentication failed")
         except LLMRateLimitError:
+            LOGGER.error("Documentation generation failed: Groq rate-limit error.")
             return CommentGenerationResult(success=False, error="LLM provider rate limit reached")
         except LLMResponseError as error:
+            LOGGER.error("Documentation generation failed: Groq response error.")
             return CommentGenerationResult(success=False, error=str(error))
         except LLMProviderError:
+            LOGGER.error("Documentation generation failed: Groq provider error.")
             return CommentGenerationResult(success=False, error="LLM provider request failed")
         except Exception:
+            LOGGER.error("Documentation generation failed: unexpected provider error.")
             return CommentGenerationResult(success=False, error="LLM provider request failed")
 
         if not documentation:

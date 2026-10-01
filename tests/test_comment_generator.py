@@ -75,14 +75,17 @@ def test_successful_generation_returns_structured_result():
     assert "This helper receives numeric items." in provider.prompts[0]
 
 
-def test_missing_api_key_returns_controlled_result(monkeypatch):
+def test_missing_api_key_returns_controlled_result(monkeypatch, caplog):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    caplog.set_level("INFO")
 
     result = CommentGenerator().generate_documentation("def function():\n    pass\n", make_element())
 
     assert result.success is False
     assert result.documentation is None
     assert "GROQ_API_KEY" in result.error
+    assert "Groq API key unavailable to Python." in caplog.text
+    assert "secret" not in caplog.text.lower()
 
 
 def test_provider_api_failure_returns_safe_result():
@@ -147,7 +150,7 @@ def test_source_length_is_limited_in_prompt():
     assert len(provider.prompts[0].split("Source:\n", 1)[1].split("\n\nElement:", 1)[0]) <= 100
 
 
-def test_groq_provider_reads_model_from_environment(monkeypatch):
+def test_groq_provider_reads_model_from_environment(monkeypatch, caplog):
     captured = {}
 
     def opener(request, timeout):
@@ -156,11 +159,15 @@ def test_groq_provider_reads_model_from_environment(monkeypatch):
         return FakeResponse({"choices": [{"message": {"content": "Documented."}}]})
 
     monkeypatch.setenv("GROQ_MODEL", "test-model")
+    caplog.set_level("INFO")
     result = GroqProvider(api_key="secret-value", opener=opener).generate("prompt")
 
     assert result == "Documented."
     assert captured["body"]["model"] == "test-model"
     assert "secret-value" in captured["authorization"]
+    assert "Groq request started." in caplog.text
+    assert "Groq request succeeded and documentation was generated." in caplog.text
+    assert "secret-value" not in caplog.text
 
 
 def test_groq_provider_handles_api_failure_without_exposing_secret():

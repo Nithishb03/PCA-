@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -68,6 +69,8 @@ def _new_repository_stats() -> dict[str, Any]:
 		"files_skipped": 0,
 		"undocumented": 0,
 		"generated": 0,
+		"generation_failures": 0,
+		"generation_error_reasons": [],
 		"safe": 0,
 		"unsafe": 0,
 		"rejected": 0,
@@ -119,6 +122,10 @@ def _process_repository(
 				stats["undocumented"] += 1
 				generation = generator.generate_documentation(source, element)
 				if not generation.success:
+					stats["generation_failures"] += 1
+					reason = generation.error or "Unknown documentation generation failure."
+					if reason not in stats["generation_error_reasons"]:
+						stats["generation_error_reasons"].append(reason)
 					continue
 				stats["generated"] += 1
 				try:
@@ -188,6 +195,9 @@ def _print_repository_stats(repository: Repository, stats: dict[str, Any]) -> No
 	print(f"Files skipped: {stats['files_skipped']}")
 	print(f"Undocumented elements: {stats['undocumented']}")
 	print(f"Generated documentation: {stats['generated']}")
+	print(f"Generation failures: {stats['generation_failures']}")
+	for reason in stats["generation_error_reasons"]:
+		print(f"Generation reason: {reason}")
 	print(f"Safe changes: {stats['safe']}")
 	print(f"Unsafe changes rejected: {stats['unsafe']}")
 	print(f"Writes: {stats['writes']}")
@@ -196,6 +206,7 @@ def _print_repository_stats(repository: Repository, stats: dict[str, Any]) -> No
 
 def main() -> None:
 	"""Run every repository scheduled for today with isolated error handling."""
+	logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 	repositories = RepositoryManager(CONFIG_PATH).get_todays_repositories()
 	if not repositories:
 		print("No repositories scheduled today.")
@@ -215,6 +226,8 @@ def main() -> None:
 		"files_skipped": 0,
 		"undocumented": 0,
 		"generated": 0,
+		"generation_failures": 0,
+		"generation_error_reasons": [],
 		"safe": 0,
 		"unsafe": 0,
 		"rejected": 0,
@@ -252,12 +265,16 @@ def main() -> None:
 			"files_skipped",
 			"undocumented",
 			"generated",
+			"generation_failures",
 			"safe",
 			"unsafe",
 			"rejected",
 			"writes",
 		):
 			summary[key] += stats[key]
+		for reason in stats["generation_error_reasons"]:
+			if reason not in summary["generation_error_reasons"]:
+				summary["generation_error_reasons"].append(reason)
 	_print_summary(summary, len(repositories), writer.write_enabled)
 
 
@@ -273,6 +290,9 @@ def _print_summary(summary: dict[str, int], scheduled: int, writes_enabled: bool
 	print(f"Files skipped: {summary['files_skipped']}")
 	print(f"Undocumented elements: {summary['undocumented']}")
 	print(f"Documentation generated: {summary['generated']}")
+	print(f"Generation failures: {summary['generation_failures']}")
+	for reason in summary["generation_error_reasons"]:
+		print(f"Generation reason: {reason}")
 	print(f"Safe proposed changes: {summary['safe']}")
 	print(f"Unsafe changes rejected: {summary['unsafe']}")
 	print(f"Rejected changes: {summary['rejected']}")
