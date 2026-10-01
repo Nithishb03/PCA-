@@ -5,8 +5,11 @@ import pytest
 
 import src.repository_manager as repository_manager_module
 from src import main as main_module
+from src.comment_generator import CommentGenerator
+from src.github_writer import GitHubWriter
 from src.models import CommentGenerationResult, Repository, ValidationResult, WriteResult
 from src.repository_manager import RepositoryManager
+from src.safety_validator import SafetyValidator
 
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "repositories.yml"
@@ -145,6 +148,11 @@ class FakeGenerator:
 		return CommentGenerationResult(success=True, documentation="Return one.")
 
 
+class SuccessfulProvider:
+	def generate(self, prompt):
+		return "Describe the function's result."
+
+
 class CountingGenerator(FakeGenerator):
 	def __init__(self):
 		self.calls = 0
@@ -279,3 +287,62 @@ def test_process_repository_reports_generation_failure_reason():
 	assert stats["generation_error_reasons"] == [
 		"LLM generation requires the GROQ_API_KEY environment variable."
 	]
+
+
+def test_successful_generation_reaches_real_safety_validator_and_dry_run_writer():
+	class MultiFileGitHubManager(FakeGitHubManager):
+		def get_directory(self, repository_url, path=""):
+			return [
+				{"name": "first.py", "type": "file"},
+				{"name": "second.py", "type": "file"},
+			]
+
+		def get_file(self, repository_url, path):
+			return "def first():\n    return 1\n" if path == "first.py" else "def second():\n    return 2\n"
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	generator = CommentGenerator(provider=SuccessfulProvider())
+	writer = GitHubWriter(write_enabled=False, opener=lambda *args, **kwargs: pytest.fail("dry-run called HTTP"))
+
+	stats = main_module._process_repository(
+		repository,
+		MultiFileGitHubManager(),
+		main_module.CodeAnalyzer(),
+		generator,
+		SafetyValidator(),
+		writer,
+	)
+
+	assert stats["files_analyzed"] == 2
+	assert stats["undocumented"] == 2
+	assert stats["generated"] == 2
+	assert stats["safe"] == 2
+	assert stats["unsafe"] == 0
+	assert stats["writes"] == 0
+
+
+def test_generation_failure_does_not_stop_later_elements():
+	class SelectiveGenerator:
+		def generate_documentation(self, source, element):
+			if element.name == "first":
+				return CommentGenerationResult(success=False, error="provider failure")
+			return CommentGenerationResult(success=True, documentation="Describe the result.")
+
+	class TwoFunctionGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return "def first():\n    return 1\n\ndef second():\n    return 2\n"
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	stats = main_module._process_repository(
+		repository,
+		TwoFunctionGitHubManager(),
+		main_module.CodeAnalyzer(),
+		SelectiveGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+	)
+
+	assert stats["undocumented"] == 2
+	assert stats["generation_failures"] == 1
+	assert stats["generated"] == 1
+	assert stats["safe"] == 1
