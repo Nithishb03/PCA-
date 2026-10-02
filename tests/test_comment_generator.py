@@ -6,6 +6,7 @@ import pytest
 
 import src.comment_generator as comment_generator_module
 from src.comment_generator import (
+    DEFAULT_GEMINI_BATCH_SIZE,
     CommentGenerator,
     GeminiProvider,
     GroqProvider,
@@ -15,6 +16,8 @@ from src.comment_generator import (
     LLMResponseError,
     LLMServiceUnavailableError,
     MissingLLMAPIKeyError,
+    _element_id,
+    get_gemini_batch_size,
 )
 from src.models import CodeElement, CommentGenerationResult
 
@@ -903,5 +906,345 @@ def test_gemini_retry_env_configuration(monkeypatch):
     )
     assert p_exp.max_retries == 1
     assert p_exp.retry_base_seconds == 2.0
+
+
+def test_batch_generation_batch_of_one_element():
+    el = make_element(name="scan_dir")
+    el_id = _element_id(el)
+    payload = {"documents": [{"element_id": el_id, "documentation": "Scan files in directory."}]}
+    provider = FakeProvider(json.dumps(payload))
+    generator = CommentGenerator(provider=provider)
+
+    results = generator.generate_documentation_batch("def scan_dir(): pass", [el])
+
+    assert len(results) == 1
+    assert el_id in results
+    assert results[el_id].success is True
+    assert results[el_id].documentation == "Scan files in directory."
+    assert results[el_id].error is None
+
+
+def test_batch_generation_batch_of_three_elements():
+    el1 = CodeElement("func_a", "function", 1, 5, False, None, False, None, True)
+    el2 = CodeElement("ClassB", "class", 10, 20, False, None, False, None, True)
+    el3 = CodeElement("method_c", "method", 12, 18, False, None, False, "ClassB", True)
+    id1 = _element_id(el1)
+    id2 = _element_id(el2)
+    id3 = _element_id(el3)
+    payload = {
+        "documents": [
+            {"element_id": id1, "documentation": "Documentation for func_a."},
+            {"element_id": id2, "documentation": "Documentation for ClassB."},
+            {"element_id": id3, "documentation": "Documentation for method_c."},
+        ]
+    }
+    provider = FakeProvider(json.dumps(payload))
+    generator = CommentGenerator(provider=provider)
+
+    results = generator.generate_documentation_batch("source code", [el1, el2, el3])
+
+    assert len(results) == 3
+    assert len(provider.prompts) == 1
+    assert results[id1].success is True
+    assert results[id1].documentation == "Documentation for func_a."
+    assert results[id2].success is True
+    assert results[id2].documentation == "Documentation for ClassB."
+    assert results[id3].success is True
+    assert results[id3].documentation == "Documentation for method_c."
+
+
+def test_deterministic_element_ids():
+    el = CodeElement("scan_dir", "function", 62, 70, False, None, False, None, True)
+    expected_id = "function:scan_dir:62"
+    assert _element_id(el) == expected_id
+    assert CommentGenerator._element_id(el) == expected_id
+    generator = CommentGenerator(provider=FakeProvider())
+    assert generator._element_id(el) == expected_id
+
+
+def test_batch_generation_valid_json_response():
+    el = make_element(name="compute_metrics")
+    el_id = _element_id(el)
+    payload = {"documents": [{"element_id": el_id, "documentation": "Compute summary metrics."}]}
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("def compute_metrics(): pass", [el])
+
+    assert results[el_id].success is True
+    assert results[el_id].documentation == "Compute summary metrics."
+
+
+def test_batch_generation_response_normalization():
+    el = make_element(name="format_text")
+    el_id = _element_id(el)
+    payload = {
+        "documents": [
+            {
+                "element_id": el_id,
+                "documentation": "```python\n\"\"\"Format the input text with proper indentation.\"\"\"\n```",
+            }
+        ]
+    }
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("def format_text(): pass", [el])
+
+    assert results[el_id].success is True
+    assert results[el_id].documentation == "Format the input text with proper indentation."
+
+
+def test_batch_generation_missing_element():
+    el1 = CodeElement("func_1", "function", 1, 5, False, None, False, None, True)
+    el2 = CodeElement("func_2", "function", 10, 15, False, None, False, None, True)
+    id1 = _element_id(el1)
+    id2 = _element_id(el2)
+    payload = {
+        "documents": [
+            {"element_id": id1, "documentation": "Docs for func_1."}
+        ]
+    }
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("source", [el1, el2])
+
+    assert results[id1].success is True
+    assert results[id2].success is False
+    assert results[id2].error == "Batch response did not contain documentation for this element."
+    assert results[id2].error_type == "response_error"
+
+
+def test_batch_generation_unknown_element_id():
+    el1 = make_element(name="target_func")
+    id1 = _element_id(el1)
+    payload = {
+        "documents": [
+            {"element_id": "function:unexpected_element:999", "documentation": "Fabricated doc."},
+            {"element_id": id1, "documentation": "Real target doc."},
+        ]
+    }
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("source", [el1])
+
+    assert "function:unexpected_element:999" not in results
+    assert results[id1].success is True
+    assert results[id1].documentation == "Real target doc."
+
+
+def test_batch_generation_duplicate_element_id():
+    el = make_element(name="dup_func")
+    el_id = _element_id(el)
+    payload = {
+        "documents": [
+            {"element_id": el_id, "documentation": "First occurrence."},
+            {"element_id": el_id, "documentation": "Second occurrence."},
+        ]
+    }
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("source", [el])
+
+    assert results[el_id].success is False
+    assert results[el_id].error_type == "response_error"
+    assert "Duplicate" in results[el_id].error
+
+
+def test_batch_generation_malformed_json():
+    el1 = make_element(name="func1")
+    el2 = make_element(name="func2")
+    id1 = _element_id(el1)
+    id2 = _element_id(el2)
+    generator = CommentGenerator(provider=FakeProvider("This is completely invalid {JSON: }}}"))
+
+    results = generator.generate_documentation_batch("source", [el1, el2])
+
+    assert results[id1].success is False
+    assert results[id2].success is False
+    assert results[id1].error_type == "response_error"
+    assert results[id2].error_type == "response_error"
+    assert "malformed JSON" in results[id1].error
+
+
+def test_batch_generation_empty_documents_list():
+    el = make_element(name="func_empty")
+    el_id = _element_id(el)
+    payload = {"documents": []}
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("source", [el])
+
+    assert results[el_id].success is False
+    assert results[el_id].error == "Batch response did not contain documentation for this element."
+    assert results[el_id].error_type == "response_error"
+
+
+def test_batch_generation_invalid_documentation_value():
+    el1 = CodeElement("func_none", "function", 1, 5, False, None, False, None, True)
+    el2 = CodeElement("func_empty_str", "function", 10, 15, False, None, False, None, True)
+    id1 = _element_id(el1)
+    id2 = _element_id(el2)
+    payload = {
+        "documents": [
+            {"element_id": id1, "documentation": None},
+            {"element_id": id2, "documentation": "   "},
+        ]
+    }
+    generator = CommentGenerator(provider=FakeProvider(json.dumps(payload)))
+
+    results = generator.generate_documentation_batch("source", [el1, el2])
+
+    assert results[id1].success is False
+    assert results[id1].error_type == "response_error"
+    assert results[id2].success is False
+    assert results[id2].error_type == "response_error"
+
+
+def test_batch_generation_provider_rate_limit_error():
+    el1 = make_element(name="f1")
+    el2 = make_element(name="f2")
+    id1 = _element_id(el1)
+    id2 = _element_id(el2)
+    provider = FakeProvider(error=LLMRateLimitError("LLM provider rate limit reached"))
+    generator = CommentGenerator(provider=provider)
+
+    results = generator.generate_documentation_batch("source", [el1, el2])
+
+    assert results[id1].success is False
+    assert results[id1].error_type == "rate_limited"
+    assert results[id1].error == "LLM provider rate limit reached"
+    assert results[id2].success is False
+    assert results[id2].error_type == "rate_limited"
+
+
+def test_batch_generation_provider_service_unavailable_error():
+    el = make_element(name="f_unavailable")
+    el_id = _element_id(el)
+    provider = FakeProvider(error=LLMServiceUnavailableError("Service temporarily unavailable"))
+    generator = CommentGenerator(provider=provider)
+
+    results = generator.generate_documentation_batch("source", [el])
+
+    assert results[el_id].success is False
+    assert results[el_id].error_type == "service_unavailable"
+    assert "temporary" in results[el_id].error
+
+
+def test_batch_generation_provider_authentication_error():
+    el = make_element(name="f_auth")
+    el_id = _element_id(el)
+    provider = FakeProvider(error=LLMAuthenticationError("LLM provider authentication failed"))
+    generator = CommentGenerator(provider=provider)
+
+    results = generator.generate_documentation_batch("source", [el])
+
+    assert results[el_id].success is False
+    assert results[el_id].error_type == "authentication"
+    assert results[el_id].error == "LLM provider authentication failed"
+
+
+def test_batch_size_environment_variable(monkeypatch):
+    assert DEFAULT_GEMINI_BATCH_SIZE == 3
+
+    monkeypatch.delenv("GEMINI_BATCH_SIZE", raising=False)
+    assert get_gemini_batch_size() == 3
+
+    monkeypatch.setenv("GEMINI_BATCH_SIZE", "5")
+    assert get_gemini_batch_size() == 5
+    generator = CommentGenerator(provider=FakeProvider())
+    assert generator.batch_size == 5
+
+    # Direct constructor batch_size overrides env
+    custom_generator = CommentGenerator(provider=FakeProvider(), batch_size=7)
+    assert custom_generator.batch_size == 7
+
+
+def test_invalid_batch_size_environment_variable(monkeypatch):
+    monkeypatch.setenv("GEMINI_BATCH_SIZE", "invalid-value")
+    assert get_gemini_batch_size() == 3
+    assert CommentGenerator(provider=FakeProvider()).batch_size == 3
+
+    monkeypatch.setenv("GEMINI_BATCH_SIZE", "0")
+    assert get_gemini_batch_size() == 3
+    assert CommentGenerator(provider=FakeProvider()).batch_size == 3
+
+    monkeypatch.setenv("GEMINI_BATCH_SIZE", "-2")
+    assert get_gemini_batch_size() == 3
+    assert CommentGenerator(provider=FakeProvider()).batch_size == 3
+
+    # Direct constructor invalid values fallback to 3
+    assert CommentGenerator(provider=FakeProvider(), batch_size=0).batch_size == 3
+    assert CommentGenerator(provider=FakeProvider(), batch_size=-10).batch_size == 3
+
+
+def test_batch_prompt_contains_every_target_element():
+    el1 = CodeElement("func_x", "function", 10, 15, False, None, False, None, True)
+    el2 = CodeElement("method_y", "method", 30, 45, False, None, False, "ClassZ", True)
+    provider = FakeProvider(json.dumps({"documents": []}))
+    generator = CommentGenerator(provider=provider)
+
+    generator.generate_documentation_batch("source code here", [el1, el2], context="Extra project context")
+
+    assert len(provider.prompts) == 1
+    prompt = provider.prompts[0]
+
+    assert "function:func_x:10" in prompt
+    assert "func_x" in prompt
+    assert "function" in prompt
+    assert "10" in prompt and "15" in prompt
+
+    assert "method:method_y:30" in prompt
+    assert "method_y" in prompt
+    assert "method" in prompt
+    assert "30" in prompt and "45" in prompt
+    assert "ClassZ" in prompt
+    assert "Extra project context" in prompt
+
+
+def test_batch_prompt_contains_return_semantics_safety_instructions():
+    el = make_element(name="scan_dir")
+    provider = FakeProvider(json.dumps({"documents": []}))
+    generator = CommentGenerator(provider=provider)
+
+    generator.generate_documentation_batch("def scan_dir(): pass", [el])
+
+    prompt = provider.prompts[0]
+
+    # Verify all safety instructions are present
+    assert "use only" in prompt.lower() or "supplied source" in prompt.lower()
+    assert "do not invent" in prompt.lower()
+    assert "parameters" in prompt.lower()
+    assert "return" in prompt.lower()
+    assert "exceptions" in prompt.lower()
+    assert "side effects" in prompt.lower()
+    assert "inspect actual return statements" in prompt.lower()
+    assert "semantic meaning" in prompt.lower()
+    assert "implementation expressions" in prompt.lower()
+    assert "document only requested elements" in prompt.lower()
+    assert "do not suggest implementation changes" in prompt.lower()
+    assert '"documents"' in prompt
+
+
+def test_afc_remains_disabled_on_gemini_provider():
+    client = FakeGeminiClient(response=FakeGeminiResponse("Generated doc text"))
+    provider = GeminiProvider(api_key="test-key", client=client)
+
+    provider.generate("Test prompt")
+
+    assert len(client.models.calls) == 1
+    call = client.models.calls[0]
+    assert call["config"] == {"automatic_function_calling": {"disable": True}}
+
+
+def test_single_element_generation_remains_unchanged():
+    el = make_element(name="legacy_func")
+    provider = FakeProvider("Legacy single element documentation.")
+    generator = CommentGenerator(provider=provider)
+
+    result = generator.generate_documentation("def legacy_func(): pass", el)
+
+    assert result.success is True
+    assert result.documentation == "Legacy single element documentation."
+    assert "legacy_func" in provider.prompts[0]
+
 
 

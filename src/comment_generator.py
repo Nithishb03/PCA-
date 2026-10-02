@@ -24,7 +24,28 @@ DEFAULT_GEMINI_REQUEST_INTERVAL_SECONDS = 4.0
 DEFAULT_GEMINI_MAX_RETRIES = 2
 DEFAULT_GEMINI_RETRY_BASE_SECONDS = 5.0
 SUPPORTED_ELEMENT_TYPES = frozenset({"function", "async_function", "class", "method"})
+DEFAULT_GEMINI_BATCH_SIZE = 3
 LOGGER = logging.getLogger(__name__)
+
+
+def get_gemini_batch_size(env_value: Optional[str] = None) -> int:
+    """Return configured batch size from GEMINI_BATCH_SIZE or fallback to 3."""
+    raw = env_value if env_value is not None else os.getenv("GEMINI_BATCH_SIZE")
+    if raw is None:
+        return DEFAULT_GEMINI_BATCH_SIZE
+    try:
+        val = int(raw)
+        if val < 1:
+            return DEFAULT_GEMINI_BATCH_SIZE
+        return val
+    except (ValueError, TypeError):
+        return DEFAULT_GEMINI_BATCH_SIZE
+
+
+def _element_id(code_element: CodeElement) -> str:
+    """Return a deterministic element ID string."""
+    return f"{code_element.element_type}:{code_element.name}:{code_element.line_number}"
+
 ELEMENT_GUIDANCE = {
     "function": "Describe the function's purpose and only explicit inputs, outputs, and side effects.",
     "async_function": "Describe the asynchronous operation and only explicit inputs, outputs, and side effects.",
@@ -347,10 +368,23 @@ class CommentGenerator:
         retry_base_seconds: Optional[float] = None,
         clock: Optional[Callable[[], float]] = None,
         sleeper: Optional[Callable[[float], None]] = None,
+        batch_size: Optional[int] = None,
     ) -> None:
         if max_source_chars < 1:
             raise ValueError("max_source_chars must be greater than zero")
         self.max_source_chars = max_source_chars
+        if batch_size is not None:
+            try:
+                parsed_batch_size = int(batch_size)
+                self.batch_size = (
+                    parsed_batch_size
+                    if parsed_batch_size >= 1
+                    else DEFAULT_GEMINI_BATCH_SIZE
+                )
+            except (ValueError, TypeError):
+                self.batch_size = DEFAULT_GEMINI_BATCH_SIZE
+        else:
+            self.batch_size = get_gemini_batch_size()
         self._provider = provider
         self._provider_error: Optional[str] = None
         if provider is None:
@@ -526,3 +560,305 @@ Additional context:
         element_offset = sum(len(line) for line in lines[:element_line_index])
         start = max(0, min(element_offset - available_chars // 3, len(source_code) - available_chars))
         return marker + source_code[start : start + available_chars]
+
+    _element_id = staticmethod(_element_id)
+
+    def generate_documentation_batch(
+        self,
+        source_code: str,
+        code_elements: list[CodeElement],
+        context: Optional[str] = None,
+    ) -> dict[str, CommentGenerationResult]:
+        """Return proposed documentation text for multiple analyzed code elements in one request."""
+        if not code_elements:
+            return {}
+
+        results: dict[str, CommentGenerationResult] = {}
+        target_elements: list[CodeElement] = []
+
+        for element in code_elements:
+            elem_id = self._element_id(element)
+            if element.element_type not in SUPPORTED_ELEMENT_TYPES:
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=f"Unsupported code element type: {element.element_type}",
+                )
+            elif element.is_private:
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error="Private code elements are not automatically documented",
+                )
+            else:
+                target_elements.append(element)
+
+        if not target_elements:
+            return results
+
+        if self._provider is None:
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=self._provider_error,
+                )
+            return results
+
+        for element in target_elements:
+            elem_id = self._element_id(element)
+            results[elem_id] = CommentGenerationResult(
+                success=False,
+                error="Batch response did not contain documentation for this element.",
+                error_type="response_error",
+            )
+
+        prompt = self._build_batch_prompt(source_code, target_elements, context)
+
+        try:
+            raw_response = self._provider.generate(prompt)
+        except LLMAuthenticationError:
+            LOGGER.error("Batch documentation generation failed: provider authentication error.")
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider authentication failed",
+                    error_type="authentication",
+                )
+            return results
+        except LLMRateLimitError:
+            LOGGER.error("Batch documentation generation failed: provider rate-limit error.")
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider rate limit reached",
+                    error_type="rate_limited",
+                )
+            return results
+        except LLMServiceUnavailableError as error:
+            provider_name = getattr(self._provider, "provider_name", "LLM")
+            error_detail = str(error)
+            LOGGER.error(
+                "Batch documentation generation failed: %s temporary service availability error.",
+                provider_name,
+            )
+            result_error = f"temporary {provider_name} service availability failure"
+            if error_detail:
+                result_error = f"{result_error}: {error_detail}"
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=result_error,
+                    error_type="service_unavailable",
+                )
+            return results
+        except LLMResponseError as error:
+            LOGGER.error("Batch documentation generation failed: provider response error.")
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=str(error),
+                    error_type="response_error",
+                )
+            return results
+        except LLMProviderError as error:
+            provider_name = getattr(self._provider, "provider_name", "LLM")
+            error_detail = str(error)
+            LOGGER.error("Batch documentation generation failed: %s provider error.", provider_name)
+            result_error = f"{provider_name} provider request failed"
+            if provider_name == "Gemini" and error_detail:
+                result_error = f"{result_error}: {error_detail}"
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=result_error,
+                )
+            return results
+        except Exception:
+            provider_name = getattr(self._provider, "provider_name", "LLM")
+            LOGGER.error("Batch documentation generation failed: unexpected %s provider error.", provider_name)
+            for element in target_elements:
+                elem_id = self._element_id(element)
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=f"{provider_name} provider request failed",
+                )
+            return results
+
+        target_ids = {self._element_id(el) for el in target_elements}
+        self._parse_batch_response_into_results(raw_response, target_ids, results)
+        return results
+
+    def _build_batch_prompt(
+        self,
+        source_code: str,
+        code_elements: list[CodeElement],
+        context: Optional[str],
+    ) -> str:
+        """Construct a structured batch documentation prompt requesting strict JSON."""
+        source_context = self._limit_source_batch(source_code, code_elements)
+        extra_context = context.strip() if context else "No additional context provided."
+
+        elements_block_lines = []
+        for element in code_elements:
+            elem_id = self._element_id(element)
+            guidance = ELEMENT_GUIDANCE.get(element.element_type, "")
+            elements_block_lines.append(
+                f"- element_id: {elem_id}\n"
+                f"  name: {element.name}\n"
+                f"  element_type: {element.element_type}\n"
+                f"  line_number: {element.line_number}\n"
+                f"  end_line_number: {element.end_line_number}\n"
+                f"  parent_class: {element.parent_class or 'None'}\n"
+                f"  guidance: {guidance}"
+            )
+        elements_block = "\n".join(elements_block_lines)
+
+        return f"""Generate documentation only for the specified target code elements.
+Understand each element before documenting it and describe only what the code actually does.
+
+Safety instructions:
+- Use only facts supported by the supplied source and context.
+- Do not invent parameters, return values, exceptions, or side effects.
+- Inspect actual return statements and describe semantic meaning rather than implementation expressions.
+- Do not invent return names or replace returned variables or values with raw implementation expressions.
+- Document only requested elements.
+- Do not suggest implementation changes.
+
+Output format:
+Return strict JSON matching exactly this schema, with no markdown code fences, no markdown formatting, and no explanation:
+{{
+  "documents": [
+    {{
+      "element_id": "...",
+      "documentation": "..."
+    }}
+  ]
+}}
+
+Source context:
+{source_context}
+
+Target elements:
+{elements_block}
+
+Additional context:
+{extra_context}
+"""
+
+    def _limit_source_batch(self, source_code: str, code_elements: list[CodeElement]) -> str:
+        """Limit source code length for batch prompts while keeping relevant code context."""
+        if len(source_code) <= self.max_source_chars or not code_elements:
+            return source_code
+
+        marker = "\n... source truncated ...\n"
+        available_chars = max(0, self.max_source_chars - len(marker))
+        lines = source_code.splitlines(keepends=True)
+        min_line = min(el.line_number for el in code_elements)
+        element_line_index = max(0, min(min_line - 1, len(lines) - 1))
+        element_offset = sum(len(line) for line in lines[:element_line_index])
+        start = max(0, min(element_offset - available_chars // 3, len(source_code) - available_chars))
+        return marker + source_code[start : start + available_chars]
+
+    def _parse_batch_response_into_results(
+        self,
+        raw_response: str,
+        target_ids: set[str],
+        results: dict[str, CommentGenerationResult],
+    ) -> None:
+        """Parse strict JSON response and populate results for target element IDs."""
+        if not isinstance(raw_response, str) or not raw_response.strip():
+            for target_id in target_ids:
+                results[target_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider returned empty documentation",
+                    error_type="response_error",
+                )
+            return
+
+        clean_text = raw_response.strip()
+        if clean_text.startswith("```"):
+            lines = clean_text.splitlines()
+            if len(lines) >= 3 and lines[-1].strip() == "```":
+                clean_text = "\n".join(lines[1:-1]).strip()
+
+        try:
+            payload = json.loads(clean_text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            for target_id in target_ids:
+                results[target_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider returned malformed JSON",
+                    error_type="response_error",
+                )
+            return
+
+        if not isinstance(payload, dict):
+            for target_id in target_ids:
+                results[target_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider returned malformed batch response: top-level must be a JSON object",
+                    error_type="response_error",
+                )
+            return
+
+        documents = payload.get("documents")
+        if not isinstance(documents, list):
+            for target_id in target_ids:
+                results[target_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider returned malformed batch response: 'documents' must be a list",
+                    error_type="response_error",
+                )
+            return
+
+        seen_ids: set[str] = set()
+        duplicate_ids: set[str] = set()
+
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            elem_id = item.get("element_id")
+            if not isinstance(elem_id, str):
+                continue
+            if elem_id not in target_ids:
+                # Unknown element ID must cause the corresponding result to be rejected
+                continue
+
+            if elem_id in seen_ids:
+                duplicate_ids.add(elem_id)
+                continue
+            seen_ids.add(elem_id)
+
+            raw_doc = item.get("documentation")
+            if not isinstance(raw_doc, str) or not raw_doc.strip():
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error="LLM provider returned invalid documentation value",
+                    error_type="response_error",
+                )
+                continue
+
+            try:
+                normalized = self._normalize_documentation(raw_doc)
+                results[elem_id] = CommentGenerationResult(
+                    success=True,
+                    documentation=normalized,
+                )
+            except LLMResponseError as error:
+                results[elem_id] = CommentGenerationResult(
+                    success=False,
+                    error=str(error),
+                    error_type="response_error",
+                )
+
+        for dup_id in duplicate_ids:
+            results[dup_id] = CommentGenerationResult(
+                success=False,
+                error=f"Duplicate element_id returned in batch response: {dup_id}",
+                error_type="response_error",
+            )
+
