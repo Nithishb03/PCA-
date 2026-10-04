@@ -10,7 +10,7 @@ from typing import Any
 
 try:
 	from .code_analyzer import CodeAnalyzer
-	from .comment_generator import CommentGenerator
+	from .comment_generator import CommentGenerator, _element_id
 	from .documentation_policy import DocumentationPolicy
 	from .github_manager import GitHubManager, GitHubManagerError
 	from .github_writer import GitHubWriter
@@ -19,7 +19,7 @@ try:
 	from .safety_validator import SafetyValidator
 except ImportError:
 	from code_analyzer import CodeAnalyzer
-	from comment_generator import CommentGenerator
+	from comment_generator import CommentGenerator, _element_id
 	from documentation_policy import DocumentationPolicy
 	from github_manager import GitHubManager, GitHubManagerError
 	from github_writer import GitHubWriter
@@ -82,7 +82,14 @@ def _build_proposed_source(source: str, element: CodeElement, documentation: str
 	definition_line = lines[index]
 	indentation = definition_line[: len(definition_line) - len(definition_line.lstrip())]
 	docstring = f"{indentation}    {json.dumps(documentation)}\n"
-	lines.insert(index + 1, docstring)
+	colon_pos = definition_line.find(":")
+	rest = definition_line[colon_pos + 1 :].strip()
+	if colon_pos != -1 and rest and not rest.startswith("#"):
+		lines[index] = f"{definition_line[:colon_pos + 1]}\n"
+		lines.insert(index + 1, docstring)
+		lines.insert(index + 2, f"{indentation}    {rest}\n")
+	else:
+		lines.insert(index + 1, docstring)
 	return "".join(lines)
 
 
@@ -147,91 +154,126 @@ def _process_repository(
 		stats["files_analyzed"] = len(analysis_results)
 		stats["status"] = "DRY RUN" if not writer.write_enabled else "PROCESSED"
 
+		batch_size = getattr(generator, "batch_size", 1)
+
 		for analysis_result in analysis_results:
 			if analysis_result.error:
 				continue
 			source = sources[analysis_result.file_path]
-			for element in analysis_result.elements:
-				if not policy.allows_element(element):
-					continue
-				stats["undocumented"] += 1
+			allowed_elements = [
+				el for el in analysis_result.elements if policy.allows_element(el)
+			]
+			if not allowed_elements:
+				continue
+
+			for i in range(0, len(allowed_elements), batch_size):
+				batch = allowed_elements[i : i + batch_size]
+				for _ in batch:
+					stats["undocumented"] += 1
+
 				if circuit_breaker.is_open:
-					stats["quota_deferred"] += 1
+					for _ in batch:
+						stats["quota_deferred"] += 1
 					reason = "Gemini quota/availability circuit breaker open; request deferred."
 					if reason not in stats["generation_error_reasons"]:
 						stats["generation_error_reasons"].append(reason)
 					continue
 
-				generation = generator.generate_documentation(source, element)
-				if not generation.success:
-					error_type = getattr(generation, "error_type", None)
-					reason = generation.error or "Unknown documentation generation failure."
-					is_429 = error_type == "rate_limited" or "rate limit" in reason.lower()
-					is_503 = error_type == "service_unavailable" or "service availability" in reason.lower()
+				if hasattr(generator, "generate_documentation_batch"):
+					batch_results = generator.generate_documentation_batch(source, batch)
+				else:
+					batch_results = {}
+					for el in batch:
+						eid = getattr(generator, "_element_id", lambda x: f"{x.element_type}:{x.name}:{x.line_number}")(el)
+						batch_results[eid] = generator.generate_documentation(source, el)
 
-					if is_429:
-						stats["rate_limited"] += 1
-						circuit_breaker.record_failure(is_quota_or_availability=True)
-					elif is_503:
-						stats["service_unavailable"] += 1
-						circuit_breaker.record_failure(is_quota_or_availability=True)
-					else:
+				batch_had_429 = False
+				batch_had_503 = False
+				batch_had_success = False
+
+				for element in batch:
+					eid = getattr(generator, "_element_id", lambda x: f"{x.element_type}:{x.name}:{x.line_number}")(element)
+					generation = batch_results.get(eid)
+					if generation is None:
 						stats["generation_failures"] += 1
-						circuit_breaker.record_failure(is_quota_or_availability=False)
+						continue
 
-					if reason not in stats["generation_error_reasons"]:
-						stats["generation_error_reasons"].append(reason)
-					continue
+					if not generation.success:
+						error_type = getattr(generation, "error_type", None)
+						reason = generation.error or "Unknown documentation generation failure."
+						is_429 = error_type == "rate_limited" or "rate limit" in reason.lower()
+						is_503 = error_type == "service_unavailable" or "service availability" in reason.lower()
 
-				circuit_breaker.record_success()
-				stats["generated"] += 1
-				try:
-					proposed_source = _build_proposed_source(
-						source,
-						element,
-						generation.documentation or "",
-					)
-				except ValueError:
-					stats["unsafe"] += 1
-					continue
-				change = DocumentationChange(
-					file_path=analysis_result.file_path,
-					element_name=element.name,
-					element_type=element.element_type,
-					original_source=source,
-					proposed_source=proposed_source,
-					documentation=generation.documentation,
-					line_number=element.line_number,
-					parent_class=element.parent_class,
-				)
-				validation = validator.validate(change)
-				if not validation.safe:
-					stats["unsafe"] += 1
-					stats["rejected"] += 1
-					continue
-				stats["safe"] += 1
-				if validation.diff:
-					stats["diffs_generated"] += 1
-				print(f"\nProposed diff for {analysis_result.file_path}:{element.name}:")
-				print(validation.diff)
-				write_result = writer.write(
-					ValidatedChange(
-						repository=repository,
+						if is_429:
+							stats["rate_limited"] += 1
+							batch_had_429 = True
+						elif is_503:
+							stats["service_unavailable"] += 1
+							batch_had_503 = True
+						else:
+							stats["generation_failures"] += 1
+
+						if reason not in stats["generation_error_reasons"]:
+							stats["generation_error_reasons"].append(reason)
+						continue
+
+					batch_had_success = True
+					stats["generated"] += 1
+					try:
+						proposed_source = _build_proposed_source(
+							source,
+							element,
+							generation.documentation or "",
+						)
+					except ValueError:
+						stats["unsafe"] += 1
+						continue
+					change = DocumentationChange(
 						file_path=analysis_result.file_path,
-						original_source=source,
-						proposed_source=proposed_source,
 						element_name=element.name,
 						element_type=element.element_type,
-						validation_result=validation,
-						generation_result=generation,
+						original_source=source,
+						proposed_source=proposed_source,
+						documentation=generation.documentation,
+						line_number=element.line_number,
+						parent_class=element.parent_class,
 					)
-				)
-				if not write_result.dry_run:
-					stats["writes_attempted"] += 1
-				if write_result.success and not write_result.dry_run:
-					stats["writes"] += 1
-				elif not write_result.success:
-					stats["rejected"] += 1
+					validation = validator.validate(change)
+					if not validation.safe:
+						stats["unsafe"] += 1
+						stats["rejected"] += 1
+						continue
+					stats["safe"] += 1
+					if validation.diff:
+						stats["diffs_generated"] += 1
+					print(f"\nProposed diff for {analysis_result.file_path}:{element.name}:")
+					print(validation.diff)
+					write_result = writer.write(
+						ValidatedChange(
+							repository=repository,
+							file_path=analysis_result.file_path,
+							original_source=source,
+							proposed_source=proposed_source,
+							element_name=element.name,
+							element_type=element.element_type,
+							validation_result=validation,
+							generation_result=generation,
+						)
+					)
+					if not write_result.dry_run:
+						stats["writes_attempted"] += 1
+					if write_result.success and not write_result.dry_run:
+						stats["writes"] += 1
+					elif not write_result.success:
+						stats["rejected"] += 1
+
+				if batch_had_success:
+					circuit_breaker.record_success()
+				elif batch_had_429 or batch_had_503:
+					circuit_breaker.record_failure(is_quota_or_availability=True)
+				else:
+					circuit_breaker.record_failure(is_quota_or_availability=False)
+
 		if writer.write_enabled:
 			stats["status"] = "REJECTED" if stats["rejected"] else "SUCCESS"
 		return stats

@@ -150,6 +150,16 @@ class FakeGenerator:
 
 class SuccessfulProvider:
 	def generate(self, prompt):
+		if "Target elements:" in prompt or "documents" in prompt:
+			import json
+			import re
+			element_ids = re.findall(r"- element_id: (\S+)", prompt)
+			return json.dumps({
+				"documents": [
+					{"element_id": eid, "documentation": "Describe the function's result."}
+					for eid in element_ids
+				]
+			})
 		return "Describe the function's result."
 
 
@@ -760,4 +770,53 @@ def test_process_repository_nested_function_diff_not_duplicated(capsys):
 	assert captured.count(header) == 1
 
 
+def test_process_repository_batches_multiple_elements_in_one_call():
+	class BatchCountingGenerator:
+		batch_size = 3
 
+		def __init__(self):
+			self.batch_calls = 0
+			self.requested_elements = []
+
+		def _element_id(self, code_element):
+			return f"{code_element.element_type}:{code_element.name}:{code_element.line_number}"
+
+		def generate_documentation_batch(self, source, code_elements, context=None):
+			self.batch_calls += 1
+			results = {}
+			for el in code_elements:
+				self.requested_elements.append(el.name)
+				results[self._element_id(el)] = CommentGenerationResult(
+					success=True,
+					documentation=f"Documented {el.name}",
+				)
+			return results
+
+	class FiveFunctionFileGitHubManager(FakeGitHubManager):
+		def get_file(self, repository_url, path):
+			return (
+				"def fn1(): pass\n"
+				"def fn2(): pass\n"
+				"def fn3(): pass\n"
+				"def fn4(): pass\n"
+				"def fn5(): pass\n"
+			)
+
+	repository = Repository("example", "https://github.com/owner/example", "monday", False)
+	generator = BatchCountingGenerator()
+
+	stats = main_module._process_repository(
+		repository,
+		FiveFunctionFileGitHubManager(),
+		main_module.CodeAnalyzer(),
+		generator,
+		SafetyValidator(),
+		GitHubWriter(write_enabled=False),
+	)
+
+	# 5 elements with batch_size=3 must result in exactly 2 batch calls (3 + 2)
+	assert stats["undocumented"] == 5
+	assert stats["generated"] == 5
+	assert stats["safe"] == 5
+	assert generator.batch_calls == 2
+	assert generator.requested_elements == ["fn1", "fn2", "fn3", "fn4", "fn5"]
