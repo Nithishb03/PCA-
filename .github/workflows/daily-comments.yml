@@ -6,18 +6,20 @@ name: Daily Comment Automation
     - cron: "30 5 * * *"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   run-automation:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       LLM_PROVIDER: "gemini"
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-3.5-flash
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      GITHUB_WRITE_ENABLED: "false"
+      GITHUB_WRITE_ENABLED: "true"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
