@@ -104,5 +104,6 @@ class WriteResult:
     file_path: Optional[str] = None
     commit_sha: Optional[str] = None
     commit_url: Optional[str] = None
+    file_sha: Optional[str] = None
     message: Optional[str] = None
     error: Optional[str] = None

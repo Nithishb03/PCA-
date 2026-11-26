@@ -236,7 +236,10 @@ def test_successful_write_returns_commit_result_and_encodes_source():
         if request.get_method() == "GET":
             return FakeResponse({"sha": "old-sha"})
         return FakeResponse(
-            {"commit": {"sha": "commit-sha", "html_url": "https://github.com/example/commit/commit-sha"}}
+            {
+                "content": {"sha": "new-blob-sha"},
+                "commit": {"sha": "commit-sha", "html_url": "https://github.com/example/commit/commit-sha"},
+            }
         )
 
     result = GitHubWriter(token="secret", write_enabled=True, opener=opener).write(make_change())
@@ -244,6 +247,7 @@ def test_successful_write_returns_commit_result_and_encodes_source():
     assert result.success is True
     assert result.dry_run is False
     assert result.commit_sha == "commit-sha"
+    assert result.file_sha == "new-blob-sha"
     assert result.commit_url.endswith("commit-sha")
     assert result.message == "docs: update Python documentation"
     assert [request.get_method() for request in requests] == ["GET", "PUT"]

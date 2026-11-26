@@ -1,5 +1,6 @@
 import base64
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,22 +52,41 @@ class E2EValidationReport:
 class DeterministicDocumentationProvider:
     """Test-only LLMProvider implementation for deterministic E2E checks."""
 
+    _DOCS_BY_TYPE = {
+        "function": "Return the calculated value.",
+        "async_function": "Asynchronously fetch the requested value.",
+        "class": "Provide calculator operations.",
+        "method": "Add two values using the calculator.",
+    }
+
     def __init__(self):
         self.prompts = []
 
     def generate(self, prompt):
         self.prompts.append(prompt)
+        if "Target elements:" in prompt:
+            matches = re.findall(
+                r"- element_id:\s*(\S+).*?^\s*element_type:\s*(\S+)",
+                prompt,
+                flags=re.MULTILINE | re.DOTALL,
+            )
+            return json.dumps(
+                {
+                    "documents": [
+                        {
+                            "element_id": element_id,
+                            "documentation": self._DOCS_BY_TYPE[element_type],
+                        }
+                        for element_id, element_type in matches
+                    ]
+                }
+            )
         element_type = next(
             line.split("=", 1)[1].strip()
             for line in prompt.splitlines()
             if line.startswith("element_type = ")
         )
-        return {
-            "function": "Return the calculated value.",
-            "async_function": "Asynchronously fetch the requested value.",
-            "class": "Provide calculator operations.",
-            "method": "Add two values using the calculator.",
-        }[element_type]
+        return self._DOCS_BY_TYPE[element_type]
 
 
 class FailingDocumentationProvider:
@@ -208,8 +228,11 @@ def test_complete_pipeline_uses_real_components_and_dry_run_writer(tmp_path, mon
     assert report.writes_completed == 0
     assert len(writer.changes) == report.safe_changes
     assert all(request.get_method() == "GET" for request in opener.requests)
-    assert len(provider.prompts) == report.documentation_generated
-    assert all("name = __init__" not in prompt for prompt in provider.prompts)
+    assert len(provider.prompts) == 2
+    assert all(
+        "name = __init__" not in prompt and "name: __init__" not in prompt
+        for prompt in provider.prompts
+    )
 
 
 def test_failed_e2e_generation_is_reported_without_stopping_pipeline(tmp_path, monkeypatch):

@@ -18,7 +18,7 @@ jobs:
       GH_PAT: ${{ secrets.GH_PAT }}
       LLM_PROVIDER: "gemini"
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: gemini-3.5-flash
+      GEMINI_MODEL: gemini-3.8-flash
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
       GITHUB_WRITE_ENABLED: "true"
     steps:

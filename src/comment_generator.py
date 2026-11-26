@@ -20,6 +20,7 @@ except ImportError:
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
 DEFAULT_GEMINI_REQUEST_INTERVAL_SECONDS = 4.0
 DEFAULT_GEMINI_MAX_RETRIES = 2
 DEFAULT_GEMINI_RETRY_BASE_SECONDS = 5.0
@@ -45,6 +46,23 @@ def get_gemini_batch_size(env_value: Optional[str] = None) -> int:
 def _element_id(code_element: CodeElement) -> str:
     """Return a deterministic element ID string."""
     return f"{code_element.element_type}:{code_element.name}:{code_element.line_number}"
+
+
+def _get_gemini_fallback_models(primary_model: Optional[str]) -> list[str]:
+    """Return ordered Gemini fallback models excluding the primary model."""
+    raw = os.getenv("GEMINI_FALLBACK_MODELS")
+    if raw is not None:
+        candidates = [item.strip() for item in raw.split(",") if item.strip()]
+    else:
+        candidates = list(DEFAULT_GEMINI_FALLBACK_MODELS)
+    seen: set[str] = set()
+    fallbacks: list[str] = []
+    for candidate in candidates:
+        if candidate == primary_model or candidate in seen:
+            continue
+        seen.add(candidate)
+        fallbacks.append(candidate)
+    return fallbacks
 
 ELEMENT_GUIDANCE = {
     "function": "Describe the function's purpose and only explicit inputs, outputs, and side effects.",
@@ -387,6 +405,7 @@ class CommentGenerator:
             self.batch_size = get_gemini_batch_size()
         self._provider = provider
         self._provider_error: Optional[str] = None
+        self._fallback_entries: list[tuple[str, Callable[[], LLMProvider], Optional[LLMProvider]]] = []
         if provider is None:
             try:
                 provider_name = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
@@ -404,16 +423,95 @@ class CommentGenerator:
                         gemini_kwargs["clock"] = clock
                     if sleeper is not None:
                         gemini_kwargs["sleeper"] = sleeper
-                    self._provider = GeminiProvider(
-                        api_key=api_key,
-                        model=model,
-                        **gemini_kwargs,
-                    )
+                    try:
+                        self._provider = GeminiProvider(
+                            api_key=api_key,
+                            model=model,
+                            **gemini_kwargs,
+                        )
+                    except MissingLLMAPIKeyError as gemini_missing_error:
+                        if os.getenv("GROQ_API_KEY"):
+                            LOGGER.warning(
+                                "GEMINI_API_KEY unavailable; falling back to Groq provider."
+                            )
+                            self._provider = GroqProvider()
+                        else:
+                            raise gemini_missing_error
+                    else:
+                        primary_model = (
+                            getattr(self._provider, "model", None)
+                            or model
+                            or os.getenv("GEMINI_MODEL")
+                            or DEFAULT_GEMINI_MODEL
+                        )
+                        for fallback_model in _get_gemini_fallback_models(primary_model):
+                            self._fallback_entries.append(
+                                (
+                                    f"Gemini:{fallback_model}",
+                                    lambda fm=fallback_model: GeminiProvider(
+                                        api_key=api_key,
+                                        model=fm,
+                                        **gemini_kwargs,
+                                    ),
+                                    None,
+                                )
+                            )
+                        if os.getenv("GROQ_API_KEY"):
+                            self._fallback_entries.append(
+                                ("Groq", lambda: GroqProvider(), None)
+                            )
                 else:
                     self._provider_error = f"Unsupported LLM_PROVIDER: {provider_name}"
             except MissingLLMAPIKeyError as error:
                 self._provider_error = str(error)
                 LOGGER.warning("CommentGenerator cannot call the selected LLM provider because its API key is unavailable.")
+
+    def _generate_with_fallback(self, prompt: str) -> str:
+        """Call the active provider and fall back across configured models/providers on errors."""
+        if self._provider is None:
+            raise LLMProviderError(self._provider_error or "No LLM provider configured.")
+        if not self._fallback_entries:
+            return self._provider.generate(prompt)
+
+        try:
+            return self._provider.generate(prompt)
+        except LLMResponseError:
+            raise
+        except (LLMRateLimitError, LLMServiceUnavailableError, LLMAuthenticationError, LLMProviderError) as primary_error:
+            last_error: Exception = primary_error
+            skip_gemini = isinstance(primary_error, LLMAuthenticationError)
+            primary_label = getattr(self._provider, "provider_name", "Primary")
+            for idx, (label, factory, cached) in enumerate(self._fallback_entries):
+                if skip_gemini and label.startswith("Gemini:"):
+                    continue
+                LOGGER.warning(
+                    "%s provider request failed (%s); falling back to %s.",
+                    primary_label,
+                    type(primary_error).__name__,
+                    label,
+                )
+                try:
+                    fallback_provider = cached if cached is not None else factory()
+                    if cached is None:
+                        self._fallback_entries[idx] = (label, factory, fallback_provider)
+                    result = fallback_provider.generate(prompt)
+                except LLMResponseError:
+                    raise
+                except LLMAuthenticationError as fallback_error:
+                    last_error = fallback_error
+                    if label.startswith("Gemini:"):
+                        skip_gemini = True
+                    continue
+                except (LLMRateLimitError, LLMServiceUnavailableError, LLMProviderError) as fallback_error:
+                    last_error = fallback_error
+                    continue
+
+                if not isinstance(primary_error, LLMServiceUnavailableError):
+                    # Avoid repeatedly hitting an exhausted, unauthorized, or invalid primary provider.
+                    self._provider = fallback_provider
+                    self._fallback_entries = self._fallback_entries[idx + 1 :]
+                return result
+            raise last_error
 
     def generate_documentation(
         self,
@@ -437,7 +535,7 @@ class CommentGenerator:
 
         prompt = self._build_prompt(source_code, code_element, context)
         try:
-            documentation = self._normalize_documentation(self._provider.generate(prompt))
+            documentation = self._normalize_documentation(self._generate_with_fallback(prompt))
         except LLMAuthenticationError:
             LOGGER.error("Documentation generation failed: provider authentication error.")
             return CommentGenerationResult(
@@ -614,7 +712,7 @@ Additional context:
         prompt = self._build_batch_prompt(source_code, target_elements, context)
 
         try:
-            raw_response = self._provider.generate(prompt)
+            raw_response = self._generate_with_fallback(prompt)
         except LLMAuthenticationError:
             LOGGER.error("Batch documentation generation failed: provider authentication error.")
             for element in target_elements:

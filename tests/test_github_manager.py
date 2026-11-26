@@ -101,6 +101,16 @@ def test_fetches_and_decodes_file(monkeypatch):
     assert GitHubManager(token="test-token").get_file(REPOSITORY_URL, "src/main.py") == "print('hello')\n"
 
 
+def test_fetches_and_decodes_file_with_sha(monkeypatch):
+    content = base64.b64encode(b"print('hello')\n").decode("ascii")
+    mock_response(monkeypatch, {"type": "file", "content": content, "sha": "blob-sha-123"})
+
+    decoded, sha = GitHubManager(token="test-token").get_file_with_sha(REPOSITORY_URL, "src/main.py")
+
+    assert decoded == "print('hello')\n"
+    assert sha == "blob-sha-123"
+
+
 def test_fetches_directory(monkeypatch):
     entries = [{"name": "main.py", "type": "file"}, {"name": "tests", "type": "dir"}]
     mock_response(monkeypatch, entries)

@@ -106,6 +106,12 @@ class GitHubWriter:
             commit = response.get("commit") if isinstance(response, dict) else None
             commit_sha = commit.get("sha") if isinstance(commit, dict) else None
             commit_url = commit.get("html_url") if isinstance(commit, dict) else None
+            content_meta = response.get("content") if isinstance(response, dict) else None
+            updated_file_sha = (
+                content_meta.get("sha")
+                if isinstance(content_meta, dict) and isinstance(content_meta.get("sha"), str)
+                else None
+            )
             if not isinstance(commit_sha, str) or not commit_sha:
                 return self._failure(change, "GitHub response did not include commit information.")
             return WriteResult(
@@ -115,6 +121,7 @@ class GitHubWriter:
                 file_path=change.file_path,
                 commit_sha=commit_sha,
                 commit_url=commit_url if isinstance(commit_url, str) else None,
+                file_sha=updated_file_sha,
                 message=COMMIT_MESSAGE,
             )
         except HTTPError as error:

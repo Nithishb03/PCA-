@@ -1247,4 +1247,90 @@ def test_single_element_generation_remains_unchanged():
     assert "legacy_func" in provider.prompts[0]
 
 
+def test_gemini_falls_back_to_alternate_gemini_model_on_429(monkeypatch):
+    calls = []
+
+    class FallbackGeminiProvider:
+        provider_name = "Gemini"
+
+        def __init__(self, api_key=None, model=None, **kwargs):
+            self.model = model or "gemini-3.8-flash"
+
+        def generate(self, prompt):
+            calls.append(self.model)
+            if self.model == "gemini-3.8-flash":
+                raise LLMRateLimitError("rate limited")
+            return "Documented via fallback Gemini model."
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr(comment_generator_module, "GeminiProvider", FallbackGeminiProvider)
+
+    generator = CommentGenerator()
+    result1 = generator.generate_documentation("def fn(): return 1", make_element())
+    result2 = generator.generate_documentation("def fn(): return 1", make_element())
+
+    assert result1.success is True
+    assert result1.documentation == "Documented via fallback Gemini model."
+    assert result2.success is True
+    # Primary was promoted to fallback after 429, so second call goes straight to fallback
+    assert calls == ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-flash"]
+
+
+def test_gemini_falls_back_to_groq_when_gemini_key_missing(monkeypatch):
+    class StubGroqProvider:
+        provider_name = "Groq"
+
+        def generate(self, prompt):
+            return "Documented via Groq fallback."
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setattr(comment_generator_module, "GroqProvider", StubGroqProvider)
+
+    result = CommentGenerator().generate_documentation("def fn(): return 1", make_element())
+
+    assert result.success is True
+    assert result.documentation == "Documented via Groq fallback."
+
+
+def test_gemini_falls_back_to_groq_when_gemini_models_fail_503(monkeypatch):
+    calls = []
+
+    class FailingGeminiProvider:
+        provider_name = "Gemini"
+
+        def __init__(self, api_key=None, model=None, **kwargs):
+            self.model = model or "gemini-3.8-flash"
+
+        def generate(self, prompt):
+            calls.append(f"gemini:{self.model}")
+            raise LLMServiceUnavailableError("503 unavailable")
+
+    class StubGroqProvider:
+        provider_name = "Groq"
+
+        def generate(self, prompt):
+            calls.append("groq")
+            return "Documented via Groq after Gemini 503."
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
+    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash")
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
+    monkeypatch.setattr(comment_generator_module, "GeminiProvider", FailingGeminiProvider)
+    monkeypatch.setattr(comment_generator_module, "GroqProvider", StubGroqProvider)
+
+    result = CommentGenerator().generate_documentation("def fn(): return 1", make_element())
+
+    assert result.success is True
+    assert result.documentation == "Documented via Groq after Gemini 503."
+    assert calls == ["gemini:gemini-3.8-flash", "gemini:gemini-2.5-flash", "groq"]
+
+
 

@@ -110,8 +110,8 @@ class GitHubManager:
             raise GitHubAccessError("GitHub response did not include a default branch")
         return default_branch
 
-    def get_file(self, repository_url: str, path: str) -> str:
-        """Fetch and decode a file from a repository's default branch."""
+    def _fetch_file_payload(self, repository_url: str, path: str) -> tuple[str, str | None]:
+        """Fetch and decode file content along with its Git blob SHA."""
         if not path or path.endswith("/"):
             raise ValueError("File path must identify a file")
         response = self._request_json(self._api_path(repository_url, f"/contents/{quote(path, safe='/')}"))
@@ -120,10 +120,22 @@ class GitHubManager:
         content = response.get("content")
         if not isinstance(content, str):
             raise GitHubAccessError("GitHub file response did not contain file content")
+        raw_sha = response.get("sha")
+        file_sha = raw_sha if isinstance(raw_sha, str) and raw_sha else None
         try:
-            return base64.b64decode(content.replace("\n", ""), validate=True).decode("utf-8")
+            decoded = base64.b64decode(content.replace("\n", ""), validate=True).decode("utf-8")
+            return decoded, file_sha
         except (ValueError, UnicodeDecodeError) as error:
             raise GitHubAccessError("GitHub returned invalid file content") from error
+
+    def get_file(self, repository_url: str, path: str) -> str:
+        """Fetch and decode a file from a repository's default branch."""
+        content, _ = self._fetch_file_payload(repository_url, path)
+        return content
+
+    def get_file_with_sha(self, repository_url: str, path: str) -> tuple[str, str | None]:
+        """Fetch and decode a file and its blob SHA from a repository's default branch."""
+        return self._fetch_file_payload(repository_url, path)
 
     def get_directory(self, repository_url: str, path: str = "") -> list[dict[str, Any]]:
         """Fetch directory entries from a repository's default branch."""

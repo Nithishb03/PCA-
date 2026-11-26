@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 try:
 	from .code_analyzer import CodeAnalyzer
@@ -28,6 +28,7 @@ except ImportError:
 	from safety_validator import SafetyValidator
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "repositories.yml"
+LOGGER = logging.getLogger(__name__)
 
 
 class CircuitBreaker:
@@ -50,15 +51,15 @@ class CircuitBreaker:
 				self.is_open = True
 
 
-def _fetch_python_sources(
+def _fetch_python_files(
 	github_manager: GitHubManager,
 	repository_url: str,
 	path: str = "",
 	policy: DocumentationPolicy | None = None,
-) -> dict[str, str]:
-	"""Recursively fetch readable Python files through the read-only GitHub manager."""
+) -> dict[str, tuple[str, Optional[str]]]:
+	"""Recursively fetch readable Python files and their blob SHAs via GitHubManager."""
 	policy = policy or DocumentationPolicy()
-	sources: dict[str, str] = {}
+	files: dict[str, tuple[str, Optional[str]]] = {}
 	for entry in github_manager.get_directory(repository_url, path):
 		entry_name = entry.get("name")
 		entry_type = entry.get("type")
@@ -67,10 +68,51 @@ def _fetch_python_sources(
 		entry_path = f"{path}/{entry_name}".strip("/")
 		if entry_type == "dir":
 			if policy.allows_directory(entry_path):
-				sources.update(_fetch_python_sources(github_manager, repository_url, entry_path, policy))
+				files.update(_fetch_python_files(github_manager, repository_url, entry_path, policy))
 		elif entry_type == "file" and policy.allows_file(entry_path):
-			sources[entry_path] = github_manager.get_file(repository_url, entry_path)
-	return sources
+			if hasattr(github_manager, "get_file_with_sha"):
+				files[entry_path] = github_manager.get_file_with_sha(repository_url, entry_path)
+			else:
+				files[entry_path] = (github_manager.get_file(repository_url, entry_path), None)
+	return files
+
+
+def _fetch_python_sources(
+	github_manager: GitHubManager,
+	repository_url: str,
+	path: str = "",
+	policy: DocumentationPolicy | None = None,
+) -> dict[str, str]:
+	"""Recursively fetch readable Python files through the read-only GitHub manager."""
+	return {
+		file_path: content
+		for file_path, (content, _) in _fetch_python_files(
+			github_manager, repository_url, path=path, policy=policy
+		).items()
+	}
+
+
+def _reconcile_element_in_source(
+	analyzer: CodeAnalyzer,
+	source: str,
+	file_path: str,
+	original_element: CodeElement,
+	occurrence_index: int,
+) -> CodeElement:
+	"""Re-locate an AST element after prior edits shifted line numbers in the same file."""
+	reanalysis = analyzer.analyze_python_file(source, file_path)
+	if reanalysis.error:
+		raise ValueError(reanalysis.error)
+	matches = [
+		el
+		for el in reanalysis.elements
+		if el.element_type == original_element.element_type
+		and el.name == original_element.name
+		and el.parent_class == original_element.parent_class
+	]
+	if occurrence_index >= len(matches):
+		raise ValueError("Code element is no longer present in updated source")
+	return matches[occurrence_index]
 
 
 def _build_proposed_source(source: str, element: CodeElement, documentation: str) -> str:
@@ -113,6 +155,7 @@ def _new_repository_stats() -> dict[str, Any]:
 		"diffs_generated": 0,
 		"writes_attempted": 0,
 		"writes": 0,
+		"write_failures": 0,
 		"error": None,
 	}
 
@@ -131,6 +174,10 @@ def _process_repository(
 	stats = _new_repository_stats()
 	policy = policy or DocumentationPolicy()
 	circuit_breaker = circuit_breaker or CircuitBreaker()
+	if getattr(repository, "protected", False) or GitHubWriter.is_protected_repository(repository):
+		stats["status"] = "SKIPPED"
+		print(f"\nRepository: {repository.name}\nStatus: SKIPPED (protected)")
+		return stats
 	try:
 		metadata = github_manager.get_repository(repository.url)
 		default_branch = github_manager.get_default_branch(repository.url)
@@ -141,14 +188,15 @@ def _process_repository(
 		print(f"Full name: {full_name}")
 		print(f"Default branch: {default_branch}")
 
-		fetched_sources = _fetch_python_sources(github_manager, repository.url, policy=policy)
-		stats["files_examined"] = len(fetched_sources)
-		sources = {
-			path: source
-			for path, source in fetched_sources.items()
-			if policy.allows_file(path, len(source))
-		}
-		stats["files_skipped"] = len(fetched_sources) - len(sources)
+		fetched_files = _fetch_python_files(github_manager, repository.url, policy=policy)
+		stats["files_examined"] = len(fetched_files)
+		sources: dict[str, str] = {}
+		file_shas: dict[str, Optional[str]] = {}
+		for path, (source, file_sha) in fetched_files.items():
+			if policy.allows_file(path, len(source)):
+				sources[path] = source
+				file_shas[path] = file_sha
+		stats["files_skipped"] = len(fetched_files) - len(sources)
 		stats["python_files"] = len(sources)
 		analysis_results = analyzer.analyze_files(sources)
 		stats["files_analyzed"] = len(analysis_results)
@@ -159,7 +207,19 @@ def _process_repository(
 		for analysis_result in analysis_results:
 			if analysis_result.error:
 				continue
-			source = sources[analysis_result.file_path]
+			file_path = analysis_result.file_path
+			original_source = sources[file_path]
+			current_source = original_source
+			current_sha = file_shas.get(file_path)
+
+			element_occurrences: dict[int, int] = {}
+			seen_keys: dict[tuple[str, str, Optional[str]], int] = {}
+			for el in analysis_result.elements:
+				key = (el.element_type, el.name, el.parent_class)
+				occ = seen_keys.get(key, 0)
+				seen_keys[key] = occ + 1
+				element_occurrences[id(el)] = occ
+
 			allowed_elements = [
 				el for el in analysis_result.elements if policy.allows_element(el)
 			]
@@ -180,12 +240,12 @@ def _process_repository(
 					continue
 
 				if hasattr(generator, "generate_documentation_batch"):
-					batch_results = generator.generate_documentation_batch(source, batch)
+					batch_results = generator.generate_documentation_batch(original_source, batch)
 				else:
 					batch_results = {}
 					for el in batch:
 						eid = getattr(generator, "_element_id", lambda x: f"{x.element_type}:{x.name}:{x.line_number}")(el)
-						batch_results[eid] = generator.generate_documentation(source, el)
+						batch_results[eid] = generator.generate_documentation(original_source, el)
 
 				batch_had_429 = False
 				batch_had_503 = False
@@ -220,23 +280,34 @@ def _process_repository(
 					batch_had_success = True
 					stats["generated"] += 1
 					try:
+						target_element = (
+							element
+							if current_source == original_source
+							else _reconcile_element_in_source(
+								analyzer,
+								current_source,
+								file_path,
+								element,
+								element_occurrences[id(element)],
+							)
+						)
 						proposed_source = _build_proposed_source(
-							source,
-							element,
+							current_source,
+							target_element,
 							generation.documentation or "",
 						)
 					except ValueError:
 						stats["unsafe"] += 1
 						continue
 					change = DocumentationChange(
-						file_path=analysis_result.file_path,
-						element_name=element.name,
-						element_type=element.element_type,
-						original_source=source,
+						file_path=file_path,
+						element_name=target_element.name,
+						element_type=target_element.element_type,
+						original_source=current_source,
 						proposed_source=proposed_source,
 						documentation=generation.documentation,
-						line_number=element.line_number,
-						parent_class=element.parent_class,
+						line_number=target_element.line_number,
+						parent_class=target_element.parent_class,
 					)
 					validation = validator.validate(change)
 					if not validation.safe:
@@ -246,26 +317,42 @@ def _process_repository(
 					stats["safe"] += 1
 					if validation.diff:
 						stats["diffs_generated"] += 1
-					print(f"\nProposed diff for {analysis_result.file_path}:{element.name}:")
+					print(f"\nProposed diff for {file_path}:{target_element.name}:")
 					print(validation.diff)
 					write_result = writer.write(
 						ValidatedChange(
 							repository=repository,
-							file_path=analysis_result.file_path,
-							original_source=source,
+							file_path=file_path,
+							original_source=current_source,
 							proposed_source=proposed_source,
-							element_name=element.name,
-							element_type=element.element_type,
+							element_name=target_element.name,
+							element_type=target_element.element_type,
 							validation_result=validation,
 							generation_result=generation,
+							file_sha=current_sha,
+							branch=default_branch,
 						)
 					)
 					if not write_result.dry_run:
 						stats["writes_attempted"] += 1
-					if write_result.success and not write_result.dry_run:
+					if write_result.success and write_result.dry_run:
+						current_source = proposed_source
+					elif write_result.success and not write_result.dry_run:
 						stats["writes"] += 1
+						if write_result.file_sha:
+							current_source = proposed_source
+							current_sha = write_result.file_sha
+						elif hasattr(github_manager, "get_file_with_sha"):
+							current_source, current_sha = github_manager.get_file_with_sha(
+								repository.url, file_path
+							)
+						else:
+							current_source = proposed_source
 					elif not write_result.success:
 						stats["rejected"] += 1
+						if not write_result.dry_run:
+							stats["write_failures"] += 1
+						print(f"Write failed for {file_path}:{target_element.name}: {write_result.error}")
 
 				if batch_had_success:
 					circuit_breaker.record_success()
@@ -278,9 +365,11 @@ def _process_repository(
 			stats["status"] = "REJECTED" if stats["rejected"] else "SUCCESS"
 		return stats
 	except GitHubManagerError as error:
+		LOGGER.error("GitHub error processing %s: %s", repository.name, error)
 		stats["error"] = str(error)
 		return stats
 	except Exception:
+		LOGGER.exception("Unexpected error processing repository %s.", repository.name)
 		stats["error"] = "Unexpected repository processing error."
 		return stats
 
@@ -345,6 +434,7 @@ def main() -> None:
 		"diffs_generated": 0,
 		"writes_attempted": 0,
 		"writes": 0,
+		"write_failures": 0,
 	}
 	if not os.getenv("GITHUB_TOKEN"):
 		print("\nGitHub access unavailable; GITHUB_TOKEN is not configured.")
@@ -362,7 +452,10 @@ def main() -> None:
 	provider_name = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 	provider_key_name = "GROQ_API_KEY" if provider_name == "groq" else "GEMINI_API_KEY"
 	if not os.getenv(provider_key_name):
-		print(f"\nLLM generation skipped because {provider_key_name} is unavailable.")
+		if provider_name == "gemini" and os.getenv("GROQ_API_KEY"):
+			print("\nGEMINI_API_KEY unavailable; using Groq fallback provider.")
+		else:
+			print(f"\nLLM generation skipped because {provider_key_name} is unavailable.")
 	if not writer.write_enabled:
 		print("GitHub write mode disabled; running in dry-run mode.")
 
@@ -380,6 +473,8 @@ def main() -> None:
 		_print_repository_stats(repository, stats)
 		if stats["error"]:
 			summary["failed"] += 1
+		elif stats["status"] == "SKIPPED":
+			summary["skipped"] += 1
 		else:
 			summary["processed"] += 1
 		for key in (
@@ -399,12 +494,15 @@ def main() -> None:
 			"diffs_generated",
 			"writes_attempted",
 			"writes",
+			"write_failures",
 		):
 			summary[key] += stats[key]
 		for reason in stats["generation_error_reasons"]:
 			if reason not in summary["generation_error_reasons"]:
 				summary["generation_error_reasons"].append(reason)
 	_print_summary(summary, len(repositories), writer.write_enabled)
+	if summary["failed"] > 0 or summary["write_failures"] > 0:
+		raise SystemExit(1)
 
 
 def _print_summary(summary: dict[str, int], scheduled: int, writes_enabled: bool) -> None:

@@ -820,3 +820,147 @@ def test_process_repository_batches_multiple_elements_in_one_call():
 	assert stats["safe"] == 5
 	assert generator.batch_calls == 2
 	assert generator.requested_elements == ["fn1", "fn2", "fn3", "fn4", "fn5"]
+
+
+def test_process_repository_skips_protected_repository_early():
+	class FailIfCalledGitHubManager:
+		def get_repository(self, repository_url):
+			raise AssertionError("Protected repository must not be fetched")
+
+	class FailIfCalledGenerator:
+		def generate_documentation_batch(self, *args, **kwargs):
+			raise AssertionError("Protected repository must not invoke LLM")
+
+		def generate_documentation(self, *args, **kwargs):
+			raise AssertionError("Protected repository must not invoke LLM")
+
+	protected_repo = Repository(
+		"project-comment-automation",
+		"https://github.com/Nithishb03/project-comment-automation",
+		"friday",
+		True,
+	)
+
+	stats = main_module._process_repository(
+		protected_repo,
+		FailIfCalledGitHubManager(),
+		main_module.CodeAnalyzer(),
+		FailIfCalledGenerator(),
+		SafetyValidator(),
+		GitHubWriter(write_enabled=True, token="secret"),
+	)
+
+	assert stats["status"] == "SKIPPED"
+	assert stats["error"] is None
+	assert stats["files_examined"] == 0
+	assert stats["writes"] == 0
+
+
+def test_process_repository_passes_file_sha_and_commits_multiple_elements_sequentially():
+	import base64
+	import json
+
+	state = {
+		"source": "def fn1(x):\n    return x\n\ndef fn2(y):\n    return y * 2\n",
+		"sha": "sha-0",
+		"commits": [],
+	}
+
+	class MultiElementGitHubManager:
+		def get_repository(self, repository_url):
+			return {"full_name": "Nithishb03/example", "default_branch": "main"}
+
+		def get_default_branch(self, repository_url):
+			return "main"
+
+		def get_directory(self, repository_url, path=""):
+			return [{"name": "mod.py", "type": "file"}]
+
+		def get_file_with_sha(self, repository_url, path):
+			return state["source"], state["sha"]
+
+	class FakeWriterResponse:
+		def __init__(self, payload):
+			self.payload = json.dumps(payload).encode("utf-8")
+
+		def __enter__(self):
+			return self
+
+		def __exit__(self, exc_type, exc_value, traceback):
+			return False
+
+		def read(self):
+			return self.payload
+
+	def fake_writer_opener(request, timeout):
+		if request.get_method() == "GET":
+			assert "ref=main" in request.full_url
+			return FakeWriterResponse({"type": "file", "sha": state["sha"]})
+		payload = json.loads(request.data.decode("utf-8"))
+		assert payload["sha"] == state["sha"]
+		assert payload["branch"] == "main"
+		new_source = base64.b64decode(payload["content"]).decode("utf-8")
+		state["source"] = new_source
+		new_sha = f"sha-{len(state['commits']) + 1}"
+		state["sha"] = new_sha
+		commit_sha = f"commit-{len(state['commits']) + 1}"
+		state["commits"].append((commit_sha, new_sha))
+		return FakeWriterResponse(
+			{
+				"content": {"sha": new_sha},
+				"commit": {"sha": commit_sha, "html_url": f"https://github.com/Nithishb03/example/commit/{commit_sha}"},
+			}
+		)
+
+	repository = Repository("example", "https://github.com/Nithishb03/example", "monday", False)
+	generator = CommentGenerator(provider=SuccessfulProvider())
+	writer = GitHubWriter(token="secret", write_enabled=True, opener=fake_writer_opener)
+
+	stats = main_module._process_repository(
+		repository,
+		MultiElementGitHubManager(),
+		main_module.CodeAnalyzer(),
+		generator,
+		SafetyValidator(),
+		writer,
+	)
+
+	assert stats["status"] == "SUCCESS"
+	assert stats["writes_attempted"] == 2
+	assert stats["writes"] == 2
+	assert stats["write_failures"] == 0
+	assert len(state["commits"]) == 2
+	assert state["sha"] == "sha-2"
+	assert state["source"].count("Describe the function's result.") == 2
+
+
+def test_main_exits_nonzero_when_repository_or_write_fails(monkeypatch):
+	class FakeRepoManager:
+		def __init__(self, path):
+			pass
+
+		def get_todays_repositories(self):
+			return [Repository("example", "https://github.com/Nithishb03/example", "monday", False)]
+
+	monkeypatch.setenv("GITHUB_TOKEN", "secret")
+	monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+	monkeypatch.setattr(main_module, "RepositoryManager", FakeRepoManager)
+	monkeypatch.setattr(main_module, "GitHubManager", lambda: object())
+	monkeypatch.setattr(main_module, "CommentGenerator", lambda: object())
+	monkeypatch.setattr(main_module, "GitHubWriter", lambda: type("W", (), {"write_enabled": True})())
+	monkeypatch.setattr(
+		main_module,
+		"_process_repository",
+		lambda *args, **kwargs: {
+			**main_module._new_repository_stats(),
+			"status": "REJECTED",
+			"writes_attempted": 1,
+			"writes": 0,
+			"write_failures": 1,
+		},
+	)
+
+	with pytest.raises(SystemExit) as exc:
+		main_module.main()
+
+	assert exc.value.code == 1
