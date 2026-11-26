@@ -211,6 +211,7 @@ def _process_repository(
 			original_source = sources[file_path]
 			current_source = original_source
 			current_sha = file_shas.get(file_path)
+			approved_changes: list[tuple[CodeElement, DocumentationChange, ValidationResult, Any]] = []
 
 			element_occurrences: dict[int, int] = {}
 			seen_keys: dict[tuple[str, str, Optional[str]], int] = {}
@@ -319,40 +320,8 @@ def _process_repository(
 						stats["diffs_generated"] += 1
 					print(f"\nProposed diff for {file_path}:{target_element.name}:")
 					print(validation.diff)
-					write_result = writer.write(
-						ValidatedChange(
-							repository=repository,
-							file_path=file_path,
-							original_source=current_source,
-							proposed_source=proposed_source,
-							element_name=target_element.name,
-							element_type=target_element.element_type,
-							validation_result=validation,
-							generation_result=generation,
-							file_sha=current_sha,
-							branch=default_branch,
-						)
-					)
-					if not write_result.dry_run:
-						stats["writes_attempted"] += 1
-					if write_result.success and write_result.dry_run:
-						current_source = proposed_source
-					elif write_result.success and not write_result.dry_run:
-						stats["writes"] += 1
-						if write_result.file_sha:
-							current_source = proposed_source
-							current_sha = write_result.file_sha
-						elif hasattr(github_manager, "get_file_with_sha"):
-							current_source, current_sha = github_manager.get_file_with_sha(
-								repository.url, file_path
-							)
-						else:
-							current_source = proposed_source
-					elif not write_result.success:
-						stats["rejected"] += 1
-						if not write_result.dry_run:
-							stats["write_failures"] += 1
-						print(f"Write failed for {file_path}:{target_element.name}: {write_result.error}")
+					approved_changes.append((element, change, validation, generation))
+					current_source = proposed_source
 
 				if batch_had_success:
 					circuit_breaker.record_success()
@@ -360,6 +329,70 @@ def _process_repository(
 					circuit_breaker.record_failure(is_quota_or_availability=True)
 				else:
 					circuit_breaker.record_failure(is_quota_or_availability=False)
+
+			if not approved_changes:
+				continue
+
+			if len(approved_changes) == 1:
+				_, single_change, file_validation, last_generation = approved_changes[0]
+				element_label = single_change.element_name
+				element_type_label = single_change.element_type
+			else:
+				initial_changes = [
+					DocumentationChange(
+						file_path=file_path,
+						element_name=orig_el.name,
+						element_type=orig_el.element_type,
+						original_source=original_source,
+						proposed_source=current_source,
+						documentation=chg.documentation,
+						line_number=orig_el.line_number,
+						parent_class=orig_el.parent_class,
+					)
+					for orig_el, chg, _, _ in approved_changes
+				]
+				if hasattr(validator, "validate_batch"):
+					file_validation = validator.validate_batch(
+						original_source,
+						current_source,
+						file_path,
+						initial_changes,
+					)
+				else:
+					file_validation = approved_changes[-1][2]
+				if not file_validation.safe:
+					stats["unsafe"] += len(approved_changes)
+					stats["rejected"] += 1
+					continue
+				last_generation = approved_changes[-1][3]
+				element_label = ", ".join(chg.element_name for _, chg, _, _ in approved_changes)
+				element_type_label = "batch"
+
+			write_result = writer.write(
+				ValidatedChange(
+					repository=repository,
+					file_path=file_path,
+					original_source=original_source,
+					proposed_source=current_source,
+					element_name=element_label,
+					element_type=element_type_label,
+					validation_result=file_validation,
+					generation_result=last_generation,
+					file_sha=current_sha,
+					branch=default_branch,
+				)
+			)
+			if not write_result.dry_run:
+				stats["writes_attempted"] += 1
+			if write_result.success and not write_result.dry_run:
+				stats["writes"] += 1
+				if write_result.file_sha:
+					current_sha = write_result.file_sha
+			elif not write_result.success:
+				stats["rejected"] += 1
+				if not write_result.dry_run:
+					stats["write_failures"] += 1
+				print(f"Write failed for {file_path} ({element_label}): {write_result.error}")
 
 		if writer.write_enabled:
 			stats["status"] = "REJECTED" if stats["rejected"] else "SUCCESS"

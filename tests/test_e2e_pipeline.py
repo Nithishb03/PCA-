@@ -226,7 +226,7 @@ def test_complete_pipeline_uses_real_components_and_dry_run_writer(tmp_path, mon
     assert report.diffs_generated > 0
     assert report.writes_attempted == 0
     assert report.writes_completed == 0
-    assert len(writer.changes) == report.safe_changes
+    assert len(writer.changes) == report.python_files_analyzed
     assert all(request.get_method() == "GET" for request in opener.requests)
     assert len(provider.prompts) == 2
     assert all(

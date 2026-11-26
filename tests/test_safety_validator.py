@@ -246,3 +246,46 @@ def test_conservatively_rejects_unsuccessful_change():
 
     assert result.safe is False
     assert "unsuccessful" in result.errors[0]
+
+
+def test_validate_batch_allows_multiple_target_docstrings_and_rejects_untargeted():
+    original = (
+        "def first(x):\n"
+        "    return x\n\n"
+        "def second(y):\n"
+        "    return y\n\n"
+        "def third(z):\n"
+        "    return z\n"
+    )
+    proposed_safe = (
+        "def first(x):\n"
+        '    """First."""\n'
+        "    return x\n\n"
+        "def second(y):\n"
+        '    """Second."""\n'
+        "    return y\n\n"
+        "def third(z):\n"
+        "    return z\n"
+    )
+    proposed_untargeted = (
+        "def first(x):\n"
+        '    """First."""\n'
+        "    return x\n\n"
+        "def second(y):\n"
+        '    """Second."""\n'
+        "    return y\n\n"
+        "def third(z):\n"
+        '    """Unexpected."""\n'
+        "    return z\n"
+    )
+    changes = [
+        DocumentationChange("example.py", "first", "function", original, proposed_safe, line_number=1),
+        DocumentationChange("example.py", "second", "function", original, proposed_safe, line_number=4),
+    ]
+
+    safe_result = VALIDATOR.validate_batch(original, proposed_safe, "example.py", changes)
+    unsafe_result = VALIDATOR.validate_batch(original, proposed_untargeted, "example.py", changes)
+
+    assert safe_result.safe is True
+    assert unsafe_result.safe is False
+    assert any("outside the target element" in err for err in unsafe_result.errors)

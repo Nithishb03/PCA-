@@ -182,20 +182,13 @@ class SafetyValidator:
             errors.append("Ambiguous duplicate definitions cannot be safely validated")
             return ValidationResult(False, errors, warnings, diff)
 
-        if _normalized_dump(original_tree) != _normalized_dump(proposed_tree):
-            errors.append("Executable or structural code changed")
-
-        try:
-            original_comments = _comment_tokens(change.original_source)
-            proposed_comments = _comment_tokens(change.proposed_source)
-        except (IndentationError, SyntaxError, tokenize.TokenError) as error:
-            errors.append(f"Unable to compare source comments: {error}")
-        else:
-            if original_comments != proposed_comments:
-                errors.append("Comments outside the target documentation changed")
-
-        if _module_docstring(original_tree) != _module_docstring(proposed_tree):
-            errors.append("Module documentation changed outside the target element")
+        self._validate_non_target_invariants(
+            change.original_source,
+            change.proposed_source,
+            original_tree,
+            proposed_tree,
+            errors,
+        )
 
         original_docs = _docstring_map(original_collector)
         proposed_docs = _docstring_map(proposed_collector)
@@ -210,6 +203,101 @@ class SafetyValidator:
             errors.append("Target documentation is missing from the proposed source")
 
         return ValidationResult(not errors, errors, warnings, diff)
+
+    def validate_batch(
+        self,
+        original_source: str,
+        proposed_source: str,
+        file_path: str,
+        changes: list[DocumentationChange],
+    ) -> ValidationResult:
+        """Validate that a combined multi-element update only modifies target docstrings."""
+        diff = self.generate_diff(original_source, proposed_source, file_path)
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        if not changes:
+            errors.append("At least one documentation change is required")
+            return ValidationResult(False, errors, warnings, diff)
+        if not file_path.lower().endswith(".py"):
+            errors.append("Safety validation only supports Python source files")
+            return ValidationResult(False, errors, warnings, diff)
+
+        try:
+            original_tree = _parse_source(original_source, file_path)
+        except (SyntaxError, ValueError, TypeError) as error:
+            errors.append(f"Invalid original Python source: {error}")
+            return ValidationResult(False, errors, warnings, diff)
+
+        try:
+            proposed_tree = _parse_source(proposed_source, file_path)
+        except (SyntaxError, ValueError, TypeError) as error:
+            errors.append(f"Invalid proposed Python source: {error}")
+            return ValidationResult(False, errors, warnings, diff)
+
+        original_collector = _collect_definitions(original_tree)
+        proposed_collector = _collect_definitions(proposed_tree)
+        if original_collector.duplicates or proposed_collector.duplicates:
+            errors.append("Ambiguous duplicate definitions cannot be safely validated")
+            return ValidationResult(False, errors, warnings, diff)
+
+        target_keys: set[tuple[tuple[str, ...], str, str]] = set()
+        for change in changes:
+            target = self._find_target(original_collector, change)
+            if target is None:
+                errors.append(f"Target element not found: {change.element_name}")
+                return ValidationResult(False, errors, warnings, diff)
+            if target.key not in proposed_collector.entries:
+                errors.append(f"Target element not found in proposed source: {change.element_name}")
+                return ValidationResult(False, errors, warnings, diff)
+            target_keys.add(target.key)
+
+        self._validate_non_target_invariants(
+            original_source,
+            proposed_source,
+            original_tree,
+            proposed_tree,
+            errors,
+        )
+
+        original_docs = _docstring_map(original_collector)
+        proposed_docs = _docstring_map(proposed_collector)
+        changed_docstrings = {
+            key for key in original_docs if original_docs.get(key) != proposed_docs.get(key)
+        }
+        if not changed_docstrings and original_source != proposed_source:
+            errors.append("No target documentation change was detected")
+        if changed_docstrings - target_keys:
+            errors.append("Documentation changed outside the target element")
+        for key in target_keys:
+            if proposed_docs.get(key) is None:
+                errors.append("Target documentation is missing from the proposed source")
+                break
+
+        return ValidationResult(not errors, errors, warnings, diff)
+
+    @staticmethod
+    def _validate_non_target_invariants(
+        original_source: str,
+        proposed_source: str,
+        original_tree: ast.AST,
+        proposed_tree: ast.AST,
+        errors: list[str],
+    ) -> None:
+        if _normalized_dump(original_tree) != _normalized_dump(proposed_tree):
+            errors.append("Executable or structural code changed")
+
+        try:
+            original_comments = _comment_tokens(original_source)
+            proposed_comments = _comment_tokens(proposed_source)
+        except (IndentationError, SyntaxError, tokenize.TokenError) as error:
+            errors.append(f"Unable to compare source comments: {error}")
+        else:
+            if original_comments != proposed_comments:
+                errors.append("Comments outside the target documentation changed")
+
+        if _module_docstring(original_tree) != _module_docstring(proposed_tree):
+            errors.append("Module documentation changed outside the target element")
 
     def validate_change(self, change: DocumentationChange) -> ValidationResult:
         """Alias for callers that prefer an explicit change-oriented method name."""

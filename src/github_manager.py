@@ -79,6 +79,7 @@ class GitHubManager:
             headers={
                 "Accept": "application/vnd.github+json",
                 "Authorization": f"Bearer {self._token}",
+                "Cache-Control": "no-cache",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             method="GET",

@@ -856,7 +856,7 @@ def test_process_repository_skips_protected_repository_early():
 	assert stats["writes"] == 0
 
 
-def test_process_repository_passes_file_sha_and_commits_multiple_elements_sequentially():
+def test_process_repository_passes_file_sha_and_commits_multiple_elements_in_one_file_write():
 	import base64
 	import json
 
@@ -926,12 +926,65 @@ def test_process_repository_passes_file_sha_and_commits_multiple_elements_sequen
 	)
 
 	assert stats["status"] == "SUCCESS"
-	assert stats["writes_attempted"] == 2
-	assert stats["writes"] == 2
+	assert stats["safe"] == 2
+	assert stats["writes_attempted"] == 1
+	assert stats["writes"] == 1
 	assert stats["write_failures"] == 0
-	assert len(state["commits"]) == 2
-	assert state["sha"] == "sha-2"
+	assert len(state["commits"]) == 1
+	assert state["sha"] == "sha-1"
 	assert state["source"].count("Describe the function's result.") == 2
+
+
+def test_process_repository_refuses_overwrite_on_external_sha_change():
+	import json
+
+	class ExternalChangeGitHubManager:
+		def get_repository(self, repository_url):
+			return {"full_name": "Nithishb03/example", "default_branch": "main"}
+
+		def get_default_branch(self, repository_url):
+			return "main"
+
+		def get_directory(self, repository_url, path=""):
+			return [{"name": "mod.py", "type": "file"}]
+
+		def get_file_with_sha(self, repository_url, path):
+			return "def fn1(x):\n    return x\n", "sha-at-analysis"
+
+	class FakeWriterResponse:
+		def __init__(self, payload):
+			self.payload = json.dumps(payload).encode("utf-8")
+
+		def __enter__(self):
+			return self
+
+		def __exit__(self, exc_type, exc_value, traceback):
+			return False
+
+		def read(self):
+			return self.payload
+
+	def fake_writer_opener(request, timeout):
+		assert request.get_method() == "GET"
+		return FakeWriterResponse({"type": "file", "sha": "sha-modified-externally"})
+
+	repository = Repository("example", "https://github.com/Nithishb03/example", "monday", False)
+	generator = CommentGenerator(provider=SuccessfulProvider())
+	writer = GitHubWriter(token="secret", write_enabled=True, opener=fake_writer_opener)
+
+	stats = main_module._process_repository(
+		repository,
+		ExternalChangeGitHubManager(),
+		main_module.CodeAnalyzer(),
+		generator,
+		SafetyValidator(),
+		writer,
+	)
+
+	assert stats["status"] == "REJECTED"
+	assert stats["writes_attempted"] == 1
+	assert stats["writes"] == 0
+	assert stats["write_failures"] == 1
 
 
 def test_main_exits_nonzero_when_repository_or_write_fails(monkeypatch):
