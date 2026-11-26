@@ -176,7 +176,7 @@ class FailingGenerator:
 	def generate_documentation(self, source, element):
 		return CommentGenerationResult(
 			success=False,
-			error="LLM generation requires the GROQ_API_KEY environment variable.",
+			error="LLM generation requires the GEMINI_API_KEY environment variable.",
 		)
 
 
@@ -295,7 +295,7 @@ def test_process_repository_reports_generation_failure_reason():
 	assert stats["generated"] == 0
 	assert stats["generation_failures"] == 1
 	assert stats["generation_error_reasons"] == [
-		"LLM generation requires the GROQ_API_KEY environment variable."
+		"LLM generation requires the GEMINI_API_KEY environment variable."
 	]
 
 

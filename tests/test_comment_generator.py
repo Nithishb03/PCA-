@@ -1,16 +1,15 @@
-import io
 import json
-from urllib.error import HTTPError
 
 import pytest
 
 import src.comment_generator as comment_generator_module
 from src.comment_generator import (
     DEFAULT_GEMINI_BATCH_SIZE,
+    DEFAULT_GEMINI_FALLBACK_MODELS,
     CommentGenerator,
     GeminiProvider,
-    GroqProvider,
     LLMAuthenticationError,
+    LLMModelNotFoundError,
     LLMProviderError,
     LLMRateLimitError,
     LLMResponseError,
@@ -130,16 +129,15 @@ def test_successful_generation_returns_structured_result():
 
 
 def test_missing_api_key_returns_controlled_result(monkeypatch, caplog):
-    monkeypatch.setenv("LLM_PROVIDER", "groq")
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     caplog.set_level("INFO")
 
     result = CommentGenerator().generate_documentation("def function():\n    pass\n", make_element())
 
     assert result.success is False
     assert result.documentation is None
-    assert "GROQ_API_KEY" in result.error
-    assert "Groq API key unavailable to Python." in caplog.text
+    assert "GEMINI_API_KEY" in result.error
+    assert "Gemini API key unavailable to Python." in caplog.text
     assert "secret" not in caplog.text.lower()
 
 
@@ -201,7 +199,6 @@ def test_comment_generator_preserves_gemini_provider_error_identity():
 
     assert result.success is False
     assert result.error.startswith("Gemini provider request failed: RuntimeError")
-    assert "Groq" not in result.error
 
 
 def test_gemini_api_error_preserves_sanitized_status_and_reason():
@@ -366,7 +363,6 @@ def test_gemini_is_default_provider_without_real_sdk_call(monkeypatch):
         def generate(self, prompt):
             return "Documentation."
 
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(comment_generator_module, "GeminiProvider", StubGeminiProvider)
 
@@ -498,64 +494,6 @@ def test_source_length_is_limited_in_prompt():
     assert result.success is True
     assert "source truncated" in provider.prompts[0]
     assert len(provider.prompts[0].split("Source:\n", 1)[1].split("\n\nElement:", 1)[0]) <= 100
-
-
-def test_groq_provider_reads_model_from_environment(monkeypatch, caplog):
-    captured = {}
-
-    def opener(request, timeout):
-        captured["body"] = json.loads(request.data.decode("utf-8"))
-        captured["authorization"] = request.get_header("Authorization")
-        return FakeResponse({"choices": [{"message": {"content": "Documented."}}]})
-
-    monkeypatch.setenv("GROQ_MODEL", "test-model")
-    caplog.set_level("INFO")
-    result = GroqProvider(api_key="secret-value", opener=opener).generate("prompt")
-
-    assert result == "Documented."
-    assert captured["body"]["model"] == "test-model"
-    assert "secret-value" in captured["authorization"]
-    assert "Groq request started." in caplog.text
-    assert "Groq request succeeded and documentation was generated." in caplog.text
-    assert "secret-value" not in caplog.text
-
-
-def test_groq_provider_handles_api_failure_without_exposing_secret():
-    def opener(request, timeout):
-        raise HTTPError(request.full_url, 500, "Server Error", {}, io.BytesIO())
-
-    with pytest.raises(LLMProviderError) as raised:
-        GroqProvider(api_key="secret-value", opener=opener).generate("prompt")
-
-    assert "secret-value" not in str(raised.value)
-
-
-def test_comment_generator_preserves_groq_provider_error_identity():
-    def opener(request, timeout):
-        raise HTTPError(request.full_url, 500, "Server Error", {}, io.BytesIO())
-
-    generator = CommentGenerator(provider=GroqProvider(api_key="secret-value", opener=opener))
-
-    result = generator.generate_documentation("source", make_element())
-
-    assert result.success is False
-    assert result.error == "Groq provider request failed"
-
-
-def test_groq_provider_handles_malformed_response():
-    def opener(request, timeout):
-        return FakeResponse({"choices": []})
-
-    with pytest.raises(LLMResponseError, match="no completion choices"):
-        GroqProvider(api_key="secret-value", opener=opener).generate("prompt")
-
-
-def test_groq_provider_handles_authentication_failure():
-    def opener(request, timeout):
-        raise HTTPError(request.full_url, 401, "Unauthorized", {}, io.BytesIO())
-
-    with pytest.raises(LLMAuthenticationError, match="authentication failed"):
-        GroqProvider(api_key="secret-value", opener=opener).generate("prompt")
 
 
 def test_gemini_provider_pacing_first_request_no_delay():
@@ -1247,7 +1185,11 @@ def test_single_element_generation_remains_unchanged():
     assert "legacy_func" in provider.prompts[0]
 
 
-def test_gemini_falls_back_to_alternate_gemini_model_on_429(monkeypatch):
+def test_gemini_default_fallback_models_configuration():
+    assert DEFAULT_GEMINI_FALLBACK_MODELS == ("gemini-3.5-flash-lite", "gemini-3.5-flash")
+
+
+def test_gemini_falls_back_through_default_models_on_429(monkeypatch):
     calls = []
 
     class FallbackGeminiProvider:
@@ -1258,15 +1200,13 @@ def test_gemini_falls_back_to_alternate_gemini_model_on_429(monkeypatch):
 
         def generate(self, prompt):
             calls.append(self.model)
-            if self.model == "gemini-3.8-flash":
+            if self.model in {"gemini-3.8-flash", "gemini-3.5-flash-lite"}:
                 raise LLMRateLimitError("rate limited")
-            return "Documented via fallback Gemini model."
+            return "Documented via gemini-3.5-flash fallback."
 
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash")
-    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_FALLBACK_MODELS", raising=False)
     monkeypatch.setattr(comment_generator_module, "GeminiProvider", FallbackGeminiProvider)
 
     generator = CommentGenerator()
@@ -1274,63 +1214,79 @@ def test_gemini_falls_back_to_alternate_gemini_model_on_429(monkeypatch):
     result2 = generator.generate_documentation("def fn(): return 1", make_element())
 
     assert result1.success is True
-    assert result1.documentation == "Documented via fallback Gemini model."
+    assert result1.documentation == "Documented via gemini-3.5-flash fallback."
     assert result2.success is True
-    # Primary was promoted to fallback after 429, so second call goes straight to fallback
-    assert calls == ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-flash"]
+    # Exhausted primary was promoted to gemini-3.5-flash, so call 2 goes directly there
+    assert calls == ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.5-flash"]
 
 
-def test_gemini_falls_back_to_groq_when_gemini_key_missing(monkeypatch):
-    class StubGroqProvider:
-        provider_name = "Groq"
-
-        def generate(self, prompt):
-            return "Documented via Groq fallback."
-
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
-    monkeypatch.setattr(comment_generator_module, "GroqProvider", StubGroqProvider)
-
-    result = CommentGenerator().generate_documentation("def fn(): return 1", make_element())
-
-    assert result.success is True
-    assert result.documentation == "Documented via Groq fallback."
-
-
-def test_gemini_falls_back_to_groq_when_gemini_models_fail_503(monkeypatch):
+def test_gemini_caches_404_fallback_model_and_skips_it_on_subsequent_calls(monkeypatch):
     calls = []
 
-    class FailingGeminiProvider:
+    class CachingGeminiProvider:
         provider_name = "Gemini"
 
         def __init__(self, api_key=None, model=None, **kwargs):
             self.model = model or "gemini-3.8-flash"
 
         def generate(self, prompt):
-            calls.append(f"gemini:{self.model}")
-            raise LLMServiceUnavailableError("503 unavailable")
+            calls.append(self.model)
+            if self.model == "gemini-3.8-flash":
+                raise LLMServiceUnavailableError("503 overloaded")
+            if self.model == "gemini-3.5-flash-lite":
+                raise LLMModelNotFoundError("GeminiApiError: status=404: reason=NOT_FOUND")
+            return "Documented via gemini-3.5-flash."
 
-    class StubGroqProvider:
-        provider_name = "Groq"
-
-        def generate(self, prompt):
-            calls.append("groq")
-            return "Documented via Groq after Gemini 503."
-
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODELS", "gemini-2.5-flash")
-    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key")
-    monkeypatch.setattr(comment_generator_module, "GeminiProvider", FailingGeminiProvider)
-    monkeypatch.setattr(comment_generator_module, "GroqProvider", StubGroqProvider)
+    monkeypatch.delenv("GEMINI_FALLBACK_MODELS", raising=False)
+    monkeypatch.setattr(comment_generator_module, "GeminiProvider", CachingGeminiProvider)
 
-    result = CommentGenerator().generate_documentation("def fn(): return 1", make_element())
+    generator = CommentGenerator()
+    result1 = generator.generate_documentation("def fn(): return 1", make_element())
+    result2 = generator.generate_documentation("def fn(): return 1", make_element())
 
-    assert result.success is True
-    assert result.documentation == "Documented via Groq after Gemini 503."
-    assert calls == ["gemini:gemini-3.8-flash", "gemini:gemini-2.5-flash", "groq"]
+    assert result1.success is True
+    assert result1.documentation == "Documented via gemini-3.5-flash."
+    assert result2.success is True
+    # Call 1: 3.8 (503) -> 3.5-flash-lite (404, cached!) -> 3.5-flash (success)
+    # Call 2: 3.8 (503) -> skips 3.5-flash-lite -> 3.5-flash (success)
+    assert calls == [
+        "gemini-3.8-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.8-flash",
+        "gemini-3.5-flash",
+    ]
+
+
+def test_gemini_primary_404_is_cached_and_falls_back(monkeypatch):
+    calls = []
+
+    class Primary404GeminiProvider:
+        provider_name = "Gemini"
+
+        def __init__(self, api_key=None, model=None, **kwargs):
+            self.model = model or "gemini-3.8-flash"
+
+        def generate(self, prompt):
+            calls.append(self.model)
+            if self.model == "gemini-3.8-flash":
+                raise LLMModelNotFoundError("GeminiApiError: status=404: reason=NOT_FOUND")
+            return "Documented via gemini-3.5-flash-lite."
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
+    monkeypatch.delenv("GEMINI_FALLBACK_MODELS", raising=False)
+    monkeypatch.setattr(comment_generator_module, "GeminiProvider", Primary404GeminiProvider)
+
+    generator = CommentGenerator()
+    result1 = generator.generate_documentation("def fn(): return 1", make_element())
+    result2 = generator.generate_documentation("def fn(): return 1", make_element())
+
+    assert result1.success is True
+    assert result2.success is True
+    assert calls == ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]
 
 
 

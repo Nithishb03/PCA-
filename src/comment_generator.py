@@ -9,18 +9,15 @@ import re
 import time
 from collections.abc import Callable
 from typing import Any, Optional, Protocol
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.error import URLError
 
 try:
     from .models import CodeElement, CommentGenerationResult
 except ImportError:
     from models import CodeElement, CommentGenerationResult
 
-GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
-DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-3.5-flash-lite", "gemini-3.5-flash")
 DEFAULT_GEMINI_REQUEST_INTERVAL_SECONDS = 4.0
 DEFAULT_GEMINI_MAX_RETRIES = 2
 DEFAULT_GEMINI_RETRY_BASE_SECONDS = 5.0
@@ -94,6 +91,10 @@ class LLMResponseError(LLMProviderError):
 
 class LLMServiceUnavailableError(LLMProviderError):
     """Raised when the provider is temporarily unavailable or experiencing high demand."""
+
+
+class LLMModelNotFoundError(LLMProviderError):
+    """Raised when the requested LLM model is unavailable or not found (404)."""
 
 
 class LLMProvider(Protocol):
@@ -226,6 +227,13 @@ class GeminiProvider:
                 status = getattr(error, "status", None)
                 status_str = str(status).upper() if status is not None else ""
                 if (
+                    status_code in {404, "404"}
+                    or status_str == "NOT_FOUND"
+                    or "404" in error_name
+                ):
+                    LOGGER.error("Gemini request returned a model-not-found error: %s", diagnostic)
+                    raise LLMModelNotFoundError(diagnostic) from None
+                if (
                     status_code in {503, "503"}
                     or status_str == "UNAVAILABLE"
                     or "unavailable" in error_name
@@ -270,7 +278,7 @@ class GeminiProvider:
         status_code = getattr(error, "status_code", getattr(error, "code", None))
         status = getattr(error, "status", None)
         message = getattr(error, "message", None) or str(error)
-        message = re.sub(r"AIza[0-9A-Za-z_-]+|gsk_[0-9A-Za-z_-]+", "[redacted]", message)
+        message = re.sub(r"AIza[0-9A-Za-z_-]+", "[redacted]", message)
         message = re.sub(r"(?i)bearer\s+\S+", "Bearer [redacted]", message)
         message = re.sub(r"(?i)(api[-_ ]?key|authorization)\s*[:=]\s*\S+", r"\1=[redacted]", message)
         message = re.sub(r"https?://\S+", "[url]", message)
@@ -283,93 +291,6 @@ class GeminiProvider:
         if message:
             details.append(message)
         return ": ".join(details)
-
-
-class GroqProvider:
-    """Minimal read-only Groq chat-completions client."""
-
-    provider_name = "Groq"
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        model: Optional[str] = None,
-        timeout: int = 30,
-        opener: Optional[Callable[..., Any]] = None,
-    ) -> None:
-        self._api_key = api_key or os.getenv("GROQ_API_KEY")
-        if not self._api_key:
-            LOGGER.warning("Groq API key unavailable to Python.")
-            raise MissingLLMAPIKeyError(
-                "LLM generation requires the GROQ_API_KEY environment variable."
-            )
-        self.model = model or os.getenv("GROQ_MODEL") or DEFAULT_GROQ_MODEL
-        self.timeout = timeout
-        self._opener = opener or urlopen
-        LOGGER.info("Groq API key available; provider initialized with model %s.", self.model)
-
-    def generate(self, prompt: str) -> str:
-        request_body = {
-            "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-        }
-        request = Request(
-            GROQ_API_URL,
-            data=json.dumps(request_body).encode("utf-8"),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
-        LOGGER.info("Groq request started.")
-        try:
-            with self._opener(request, timeout=self.timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            if error.code in {401, 403}:
-                LOGGER.error("Groq request returned an authentication error.")
-                raise LLMAuthenticationError("LLM provider authentication failed") from error
-            if error.code == 429:
-                LOGGER.error("Groq request returned a rate-limit error.")
-                raise LLMRateLimitError("LLM provider rate limit reached") from error
-            LOGGER.error("Groq request returned an API error.")
-            raise LLMProviderError(f"LLM provider returned HTTP {error.code}") from error
-        except (URLError, TimeoutError, OSError):
-            LOGGER.error("Groq request returned a network error.")
-            raise LLMProviderError("Unable to reach the LLM provider") from None
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            LOGGER.error("Groq request succeeded but response parsing failed.")
-            raise LLMResponseError("LLM provider returned malformed JSON") from None
-
-        documentation = self._extract_documentation(payload)
-        LOGGER.info("Groq request succeeded and documentation was generated.")
-        return documentation
-
-    @staticmethod
-    def _extract_documentation(payload: Any) -> str:
-        if not isinstance(payload, dict):
-            LOGGER.error("Groq response parsing failed: malformed response.")
-            raise LLMResponseError("LLM provider returned a malformed response")
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
-            LOGGER.error("Groq response parsing failed: no completion choices.")
-            raise LLMResponseError("LLM provider returned no completion choices")
-        first_choice = choices[0]
-        if not isinstance(first_choice, dict):
-            LOGGER.error("Groq response parsing failed: malformed completion.")
-            raise LLMResponseError("LLM provider returned a malformed completion")
-        message = first_choice.get("message")
-        if not isinstance(message, dict):
-            LOGGER.error("Groq response parsing failed: malformed message.")
-            raise LLMResponseError("LLM provider returned a malformed message")
-        documentation = message.get("content")
-        if not isinstance(documentation, str) or not documentation.strip():
-            LOGGER.error("Groq response parsing failed: empty documentation.")
-            raise LLMResponseError("LLM provider returned empty documentation")
-        return documentation.strip()
 
 
 class CommentGenerator:
@@ -406,112 +327,109 @@ class CommentGenerator:
         self._provider = provider
         self._provider_error: Optional[str] = None
         self._fallback_entries: list[tuple[str, Callable[[], LLMProvider], Optional[LLMProvider]]] = []
+        self._unavailable_models: set[str] = set()
         if provider is None:
             try:
-                provider_name = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-                if provider_name == "groq":
-                    self._provider = GroqProvider(api_key=api_key, model=model)
-                elif provider_name == "gemini":
-                    gemini_kwargs: dict[str, Any] = {}
-                    if request_interval is not None:
-                        gemini_kwargs["request_interval"] = request_interval
-                    if max_retries is not None:
-                        gemini_kwargs["max_retries"] = max_retries
-                    if retry_base_seconds is not None:
-                        gemini_kwargs["retry_base_seconds"] = retry_base_seconds
-                    if clock is not None:
-                        gemini_kwargs["clock"] = clock
-                    if sleeper is not None:
-                        gemini_kwargs["sleeper"] = sleeper
-                    try:
-                        self._provider = GeminiProvider(
-                            api_key=api_key,
-                            model=model,
-                            **gemini_kwargs,
+                gemini_kwargs: dict[str, Any] = {}
+                if request_interval is not None:
+                    gemini_kwargs["request_interval"] = request_interval
+                if max_retries is not None:
+                    gemini_kwargs["max_retries"] = max_retries
+                if retry_base_seconds is not None:
+                    gemini_kwargs["retry_base_seconds"] = retry_base_seconds
+                if clock is not None:
+                    gemini_kwargs["clock"] = clock
+                if sleeper is not None:
+                    gemini_kwargs["sleeper"] = sleeper
+                self._provider = GeminiProvider(
+                    api_key=api_key,
+                    model=model,
+                    **gemini_kwargs,
+                )
+                primary_model = (
+                    getattr(self._provider, "model", None)
+                    or model
+                    or os.getenv("GEMINI_MODEL")
+                    or DEFAULT_GEMINI_MODEL
+                )
+                for fallback_model in _get_gemini_fallback_models(primary_model):
+                    self._fallback_entries.append(
+                        (
+                            fallback_model,
+                            lambda fm=fallback_model: GeminiProvider(
+                                api_key=api_key,
+                                model=fm,
+                                **gemini_kwargs,
+                            ),
+                            None,
                         )
-                    except MissingLLMAPIKeyError as gemini_missing_error:
-                        if os.getenv("GROQ_API_KEY"):
-                            LOGGER.warning(
-                                "GEMINI_API_KEY unavailable; falling back to Groq provider."
-                            )
-                            self._provider = GroqProvider()
-                        else:
-                            raise gemini_missing_error
-                    else:
-                        primary_model = (
-                            getattr(self._provider, "model", None)
-                            or model
-                            or os.getenv("GEMINI_MODEL")
-                            or DEFAULT_GEMINI_MODEL
-                        )
-                        for fallback_model in _get_gemini_fallback_models(primary_model):
-                            self._fallback_entries.append(
-                                (
-                                    f"Gemini:{fallback_model}",
-                                    lambda fm=fallback_model: GeminiProvider(
-                                        api_key=api_key,
-                                        model=fm,
-                                        **gemini_kwargs,
-                                    ),
-                                    None,
-                                )
-                            )
-                        if os.getenv("GROQ_API_KEY"):
-                            self._fallback_entries.append(
-                                ("Groq", lambda: GroqProvider(), None)
-                            )
-                else:
-                    self._provider_error = f"Unsupported LLM_PROVIDER: {provider_name}"
+                    )
             except MissingLLMAPIKeyError as error:
                 self._provider_error = str(error)
-                LOGGER.warning("CommentGenerator cannot call the selected LLM provider because its API key is unavailable.")
+                LOGGER.warning("CommentGenerator cannot call Gemini because GEMINI_API_KEY is unavailable.")
+
+    @staticmethod
+    def _is_model_not_found_error(error: Exception) -> bool:
+        """Return whether an error indicates the requested model was not found (404)."""
+        if isinstance(error, LLMModelNotFoundError):
+            return True
+        detail = str(error).lower()
+        return "status=404" in detail or "reason=not_found" in detail
 
     def _generate_with_fallback(self, prompt: str) -> str:
-        """Call the active provider and fall back across configured models/providers on errors."""
+        """Call the active Gemini provider and fall back across models while caching 404s."""
         if self._provider is None:
             raise LLMProviderError(self._provider_error or "No LLM provider configured.")
         if not self._fallback_entries:
             return self._provider.generate(prompt)
 
-        try:
-            return self._provider.generate(prompt)
-        except LLMResponseError:
-            raise
-        except (LLMRateLimitError, LLMServiceUnavailableError, LLMAuthenticationError, LLMProviderError) as primary_error:
-            last_error: Exception = primary_error
-            skip_gemini = isinstance(primary_error, LLMAuthenticationError)
-            primary_label = getattr(self._provider, "provider_name", "Primary")
-            for idx, (label, factory, cached) in enumerate(self._fallback_entries):
-                if skip_gemini and label.startswith("Gemini:"):
-                    continue
-                LOGGER.warning(
-                    "%s provider request failed (%s); falling back to %s.",
-                    primary_label,
-                    type(primary_error).__name__,
-                    label,
-                )
-                try:
-                    fallback_provider = cached if cached is not None else factory()
-                    if cached is None:
-                        self._fallback_entries[idx] = (label, factory, fallback_provider)
-                    result = fallback_provider.generate(prompt)
-                except LLMResponseError:
-                    raise
-                except LLMAuthenticationError as fallback_error:
-                    last_error = fallback_error
-                    if label.startswith("Gemini:"):
-                        skip_gemini = True
-                    continue
-                except (LLMRateLimitError, LLMServiceUnavailableError, LLMProviderError) as fallback_error:
-                    last_error = fallback_error
-                    continue
+        primary_model = getattr(self._provider, "model", None)
+        primary_error: Optional[Exception] = None
+        if primary_model not in self._unavailable_models:
+            try:
+                return self._provider.generate(prompt)
+            except (LLMResponseError, LLMAuthenticationError):
+                raise
+            except (LLMRateLimitError, LLMServiceUnavailableError, LLMProviderError) as error:
+                primary_error = error
+                if self._is_model_not_found_error(error) and isinstance(primary_model, str):
+                    self._unavailable_models.add(primary_model)
+                    LOGGER.warning("Marking Gemini model %s unavailable for this run (404).", primary_model)
 
-                if not isinstance(primary_error, LLMServiceUnavailableError):
-                    # Avoid repeatedly hitting an exhausted, unauthorized, or invalid primary provider.
-                    self._provider = fallback_provider
-                    self._fallback_entries = self._fallback_entries[idx + 1 :]
-                return result
-            raise last_error
+        last_error: Exception = primary_error or LLMProviderError("Active Gemini model is unavailable.")
+        for idx, (fallback_model, factory, cached) in enumerate(self._fallback_entries):
+            if fallback_model in self._unavailable_models:
+                continue
+            LOGGER.warning(
+                "Gemini model %s failed (%s); falling back to %s.",
+                primary_model or "primary",
+                type(last_error).__name__,
+                fallback_model,
+            )
+            try:
+                fallback_provider = cached if cached is not None else factory()
+                if cached is None:
+                    self._fallback_entries[idx] = (fallback_model, factory, fallback_provider)
+                result = fallback_provider.generate(prompt)
+            except (LLMResponseError, LLMAuthenticationError):
+                raise
+            except (LLMRateLimitError, LLMServiceUnavailableError, LLMProviderError) as fallback_error:
+                last_error = fallback_error
+                if self._is_model_not_found_error(fallback_error):
+                    self._unavailable_models.add(fallback_model)
+                    LOGGER.warning(
+                        "Marking Gemini fallback model %s unavailable for this run (404).",
+                        fallback_model,
+                    )
+                continue
+
+            if primary_model in self._unavailable_models or isinstance(primary_error, LLMRateLimitError):
+                # Avoid repeatedly hitting an exhausted or 404 primary model.
+                self._provider = fallback_provider
+                self._fallback_entries = self._fallback_entries[idx + 1 :]
+            return result
+
+        raise last_error
 
     def generate_documentation(
         self,

@@ -37,7 +37,6 @@ def test_real_gemini_documentation_quality_and_diff(monkeypatch):
     if not os.getenv("GEMINI_API_KEY"):
         pytest.skip("GEMINI_API_KEY is unavailable")
 
-    monkeypatch.setenv("LLM_PROVIDER", "gemini")
     LOGGER.info("Real Gemini documentation quality and diff validation started.")
 
     analyzer = CodeAnalyzer()

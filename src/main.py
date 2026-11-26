@@ -449,13 +449,8 @@ def main() -> None:
 	generator = CommentGenerator()
 	validator = SafetyValidator()
 	writer = GitHubWriter()
-	provider_name = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-	provider_key_name = "GROQ_API_KEY" if provider_name == "groq" else "GEMINI_API_KEY"
-	if not os.getenv(provider_key_name):
-		if provider_name == "gemini" and os.getenv("GROQ_API_KEY"):
-			print("\nGEMINI_API_KEY unavailable; using Groq fallback provider.")
-		else:
-			print(f"\nLLM generation skipped because {provider_key_name} is unavailable.")
+	if not os.getenv("GEMINI_API_KEY"):
+		print("\nLLM generation skipped because GEMINI_API_KEY is unavailable.")
 	if not writer.write_enabled:
 		print("GitHub write mode disabled; running in dry-run mode.")
 
